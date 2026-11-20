@@ -8,13 +8,16 @@
 
 前置：桌面版 DSH，且已装 `dsh-pet` 与 `dsh-see-now`（本插件依赖它们）。
 
+从 **Releases** 下载源码包（或 `git clone` 本仓库），进入目录后运行：
+
 ```bash
-dsh plugin --profile desktop add dsh-pet-see-live
+node scripts/install-dev.mjs
 ```
 
-装完**重启 DSH** 生效。就这样，没有配置文件要填。
+脚本会把插件复制进 desktop profile 并登记 bundle，装完**重启 DSH** 生效。没有配置文件要填。
 
-> 源码安装：`git clone` 后运行 `node scripts/install-dev.mjs`，同样重启 DSH。
+> 为什么不用 `dsh plugin add`：desktop profile 由 DSH 桌面端独占管理，`dsh plugin --profile desktop ...` 会被拒绝，所以这里用随附的 `install-dev.mjs` 安装（和 see-now 的源码安装方式一致）。
+> 想先看看会改什么：`node scripts/install-dev.mjs --check`。可用 `DSH_PROFILE` 指定其它 profile。
 
 ## 行为
 
@@ -38,9 +41,13 @@ dsh plugin --profile desktop add dsh-pet-see-live
 
 ## 卸载
 
+在仓库目录运行：
+
 ```bash
-dsh plugin --profile desktop remove dsh-pet-see-live
+node scripts/install-dev.mjs --remove
 ```
+
+然后重启 DSH。
 
 ## 许可
 
