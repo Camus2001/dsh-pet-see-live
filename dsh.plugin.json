@@ -1,0 +1,9 @@
+{
+  "name": "dsh-pet-see-live",
+  "description": "Real-time screen watching for dsh-pet, following dsh lifecycle.",
+  "version": "0.1.0",
+  "entry": {
+    "name": "dsh-pet-see-live",
+    "inject": []
+  }
+}
