@@ -169,6 +169,14 @@ export async function apply(ctx) {
     log('capture stopped');
   }
 
+  /** 统一退避：dsh-pet 把生成失败/限流都包成 HTTP 200 + body.ok=false，必须看 body 才不会误判成功。 */
+  function backoff(reason) {
+    const delay = Math.min(300000, 30000 * (2 ** Math.min(consecutiveFails, 5)));
+    backoffUntil = Date.now() + delay;
+    consecutiveFails += 1;
+    log(`${reason} → backoff ${delay}ms`);
+  }
+
   async function drain() {
     if (inflight || disposed || !petAlive || !petBase) return;
     const now = Date.now();
@@ -179,23 +187,29 @@ export async function apply(ctx) {
     inflight = true;
     try {
       const { status, body } = await postImage(petBase, sheet.png);
-      if (status >= 200 && status < 300) {
+      // dsh-pet 的 /chat 用 okResult/failResult 包装，成功与失败都是 HTTP 200，
+      // 区别只在 body 的 ok 字段。这里必须解 body，否则限流/超时会被当成成功继续喂图。
+      let bodyOk = true;
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed && parsed.ok === false) bodyOk = false;
+      } catch { /* 非 JSON 无法判断，按成功处理（pet 正常返回都是 JSON） */ }
+      if (status >= 200 && status < 300 && bodyOk) {
         lastSentAt = Date.now(); consecutiveFails = 0;
         log(`OK status=${status} sheet@${sheet.at}s why=${sheet.why} :: ${body.slice(0, 160)}`);
         try { appendFileSync(WATCH_LOG, `${new Date().toISOString()} OK ${body}\n`, 'utf8'); } catch { /* ignore */ }
       } else if (status === 429 || status >= 500) {
-        const delay = Math.min(300000, 30000 * (2 ** consecutiveFails));
-        backoffUntil = Date.now() + delay; consecutiveFails += 1;
-        log(`THROTTLE status=${status} → backoff ${delay}ms`);
+        backoff(`THROTTLE status=${status}`);
+      } else if (status >= 200 && status < 300 && !bodyOk) {
+        // 限流 / 余额不足 / 超时等：HTTP 200 但 body.ok=false
+        backoff(`SOFT-FAIL body.ok=false :: ${body.slice(0, 160)}`);
+        try { appendFileSync(WATCH_LOG, `${new Date().toISOString()} SOFT-FAIL ${body}\n`, 'utf8'); } catch { /* ignore */ }
       } else {
         consecutiveFails += 1;
         log(`FAIL status=${status} :: ${body.slice(0, 200)}`);
       }
     } catch (e) {
-      consecutiveFails += 1;
-      const delay = Math.min(300000, 30000 * (2 ** Math.min(consecutiveFails - 1, 5)));
-      backoffUntil = Date.now() + delay;
-      log(`ERR ${e.message} → backoff ${delay}ms`);
+      backoff(`ERR ${e.message}`);
     } finally { inflight = false; }
   }
 
