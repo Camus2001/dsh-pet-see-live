@@ -86,11 +86,34 @@ async function checkPet() {
   } catch { return { up: false, base }; }
 }
 
+/**
+ * 把 see-now 图集的帧清单写成 pet 能读懂的时间顺序说明。
+ *
+ * 图里每格虽然烧了编号，但只发 PNG 的话模型不知道编号代表什么；
+ * see-now 原本会在工具文本里附带 frame@时间码，这里补上同一份信息。
+ */
+function sheetPrompt(sheet) {
+  const frames = Array.isArray(sheet?.frames) ? sheet.frames : [];
+  if (frames.length < 2) return '看一眼我现在的屏幕，用简短一句话吐槽或评价，不超过20字。';
+  const first = Number(frames[0].t) || 0;
+  const last = Number(frames[frames.length - 1].t) || first;
+  const times = frames
+    .map((f, i) => `${i + 1}=+${Math.max(0, (Number(f.t) || 0) - first).toFixed(1)}s`)
+    .join('、');
+  return [
+    `这是一张按时间采样的连拍图集，不是一张静态截图：共 ${frames.length} 帧，`
+      + `每格左上角的编号 1→${frames.length} 就是真实时间顺序（1 最早，${frames.length} 最晚），`
+      + '不要按左右/上下阅读顺序理解。',
+    `各帧相对第 1 帧的时刻：${times}；整段跨度 ${Math.max(0, last - first).toFixed(1)} 秒。`,
+    '请按时间先后看这几帧，用一到两句话概述或吐槽这段时间屏幕上的变化，不超过30字。',
+  ].join('\n');
+}
+
 /** 把一张图喂给 pet（Node 原生 fetch，无 curl 依赖）。 */
-async function postImage(base, pngBuffer) {
+async function postImage(base, sheet) {
   const payload = JSON.stringify({
-    text: '看一眼我现在的屏幕，用简短一句话吐槽或评价，不超过20字。',
-    attachment: { mediaType: 'image/png', data: pngBuffer.toString('base64') },
+    text: sheetPrompt(sheet),
+    attachment: { mediaType: 'image/png', data: sheet.png.toString('base64') },
   });
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 120000);
@@ -186,7 +209,7 @@ export async function apply(ctx) {
     pendingSheet = null;
     inflight = true;
     try {
-      const { status, body } = await postImage(petBase, sheet.png);
+      const { status, body } = await postImage(petBase, sheet);
       // dsh-pet 的 /chat 用 okResult/failResult 包装，成功与失败都是 HTTP 200，
       // 区别只在 body 的 ok 字段。这里必须解 body，否则限流/超时会被当成成功继续喂图。
       let bodyOk = true;
