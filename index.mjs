@@ -44,8 +44,6 @@ function log(line) {
 // 之后每 15s 一次心跳；宿主侧 30s 收不到心跳就当作"不可信"，一律按不在前台处理（保持抓屏），
 // 这样渲染端崩溃 / 页面重载时最多退化成"不暂停"，不会把采集永久卡住。
 const FOCUS_FRESH_MS = 30_000;
-let focusReport = null;
-let focusSeen = false;
 
 // see-now 的节奏/档位定义（捕获异常：缺失时优雅禁用）
 let spawnFrames, createPipeline, PACES, SIZES, DEFAULT_PACE, DEFAULT_QUALITY;
@@ -60,13 +58,16 @@ try {
 // see-now 的设置读取器：与它自己的设置页共用同一份校验逻辑。
 // `dsh-see-now` 的 exports 没有暴露 `./tuning`，所以从包根定位 `src/tuning.js`。
 // 缺失时退回只读 see-now.json 的旧路径（至少 pace / fps 仍可用）。
-let readSeeNowTuning = null;
-try {
+async function importSeeNowFile(rel) {
   const require = createRequire(import.meta.url);
   const pkg = require.resolve('dsh-see-now/package.json');
-  ({ readTuning: readSeeNowTuning } = await import(
-    pathToFileURL(join(dirname(pkg), 'src', 'tuning.js')).href
-  ));
+  return import(pathToFileURL(join(dirname(pkg), rel)).href);
+}
+
+let readSeeNowTuning = null;
+let LISTEN_DEFAULTS = null;
+try {
+  ({ readTuning: readSeeNowTuning, LISTEN_DEFAULTS } = await importSeeNowFile('src/tuning.js'));
 } catch (e) {
   log(`tuning reader unavailable (${e.message}); only defaultPace/fps will follow see-now`);
 }
@@ -76,16 +77,8 @@ try {
 // 转写完全交给 listener 自己：它内部用 see-now 的 resolveTranscriber，
 // 读取 see-now 设置页的 prefer / live / silence 等以及 ~/.dsh/asr.json，本插件不另做识别配置。
 let createListener = null;
-let LISTEN_DEFAULTS = null;
 try {
-  const require = createRequire(import.meta.url);
-  const pkg = require.resolve('dsh-see-now/package.json');
-  ({ createListener } = await import(
-    pathToFileURL(join(dirname(pkg), 'src', 'listen.js')).href
-  ));
-  ({ LISTEN_DEFAULTS } = await import(
-    pathToFileURL(join(dirname(pkg), 'src', 'tuning.js')).href
-  ));
+  ({ createListener } = await importSeeNowFile('src/listen.js'));
 } catch (e) {
   log(`listener unavailable (${e.message}); audio listening disabled`);
 }
@@ -158,10 +151,8 @@ function resolveFfmpeg() {
 
 // 正规接口：pet 的 HTTP 路由挂在 DSH 的 webServer 上，端口直接读它暴露的 port。
 // dsh-pet 自己也用 ctx.webServer.port（见其 app.js），不再解析 logs.txt 里的 config 行。
-let webServer = null;
-
 /** pet 是否在：端口可达即 pet 开着（跨平台，不查进程）。 */
-async function checkPet(ctx) {
+async function checkPet(ctx, webServer) {
   let ws = webServer;
   if (!ws && ctx) {
     // 注入回调可能晚于首次检查；ctx.webServer 未注入时 getter 会抛，吞掉即可。
@@ -181,14 +172,14 @@ async function checkPet(ctx) {
 }
 
 /** 挂设置页用的同源 HTTP API：GET /status、POST /config。 */
-function installSettingsApi(ctx) {
+function installSettingsApi(ctx, focus, onWebServer) {
   if (!ctx?.inject) return;
   try {
     ctx.inject(['webServer'], (scoped) => {
-      webServer = scoped.webServer;   // 捕获 DSH 注入的 webServer，供 checkPet 读取端口
+      onWebServer(scoped.webServer);   // 捕获 DSH 注入的 webServer，供 checkPet 读取端口
       scoped.effect(() => scoped.webServer.register({
         kind: 'prefix', path: API_PREFIX, auth: 'required',
-        handler: (req, res) => { void handleSettingsRequest(req, res); },
+        handler: (req, res) => { void handleSettingsRequest(req, res, focus); },
       }, 'dsh-pet-see-live: settings routes'));
     });
   } catch (e) {
@@ -196,7 +187,7 @@ function installSettingsApi(ctx) {
   }
 }
 
-async function handleSettingsRequest(req, res) {
+async function handleSettingsRequest(req, res, focus) {
   const send = (status, obj) => {
     try {
       res.statusCode = status;
@@ -249,9 +240,9 @@ async function handleSettingsRequest(req, res) {
         send(400, { ok: false, reason: 'bad-config' });
         return;
       }
-      focusReport = { focused: body.focused, at: Date.now() };
-      if (!focusSeen) {
-        focusSeen = true;
+      focus.report = { focused: body.focused, at: Date.now() };
+      if (!focus.seen) {
+        focus.seen = true;
         log(`focus signal from renderer: ${body.focused ? 'focused' : 'blurred'}`);
       }
       send(200, { ok: true });
@@ -389,7 +380,7 @@ export async function apply(ctx) {
   }
   const { pace, fps, p, tuning } = seeNowSettings();
   const { listenEnabled, pauseOnFocus } = readPetSeeConfig();
-  const quality = DEFAULT_QUALITY || 'low';
+  const quality = DEFAULT_QUALITY;
   const [width, height] = SIZES[quality];
   const wakeGapMs = p.wakeGapSec * 1000;   // see-now 自己的"多久叫醒一次"
   const ffmpegPath = resolveFfmpeg();
@@ -400,7 +391,9 @@ export async function apply(ctx) {
       + ` tier=${tuning ? `${tuning.tierStyle}/${tuning.tierMode}/${tuning.tierCurve}` : 'defaults'}`
       + ` ffmpeg=${ffmpegPath}`,
   );
-  installSettingsApi(ctx);
+  const focus = { report: null, seen: false };
+  let webServer = null;
+  installSettingsApi(ctx, focus, (ws) => { webServer = ws; });
 
   let disposed = false;
   let petAlive = false;
@@ -431,8 +424,8 @@ export async function apply(ctx) {
 
   /** 渲染端心跳新鲜才采信；过期视为"不在前台"。 */
   const focusState = () => {
-    if (!focusReport || Date.now() - focusReport.at > FOCUS_FRESH_MS) return false;
-    return focusReport.focused === true;
+    if (!focus.report || Date.now() - focus.report.at > FOCUS_FRESH_MS) return false;
+    return focus.report.focused === true;
   };
 
   // 出图参数全部来自 see-now：pace 管 cutAbs / 兜底节奏，设置页的档位参数走 tuning
@@ -442,7 +435,7 @@ export async function apply(ctx) {
     ...p.pipeline,
     ...pipelineTuningOf(tuning),
   };
-  let pipeline = createPipeline(pipelineOpts);
+  let pipeline = null;   // 由 startCapture 惰性创建，避免重建时白做一次
 
   function startCapture() {
     if (captureOn || disposed || dshFocused) return;
@@ -596,7 +589,7 @@ export async function apply(ctx) {
     try {
       const now = Date.now();
       if (pauseOnFocus) setFocused(focusState());
-      const pet = (now - lastPetCheck >= 2000) ? await checkPet(ctx) : null;
+      const pet = (now - lastPetCheck >= 2000) ? await checkPet(ctx, webServer) : null;
       if (pet) {
         lastPetCheck = Date.now();
         petBase = pet.base;
@@ -623,7 +616,7 @@ export async function apply(ctx) {
               if (got && got.length) s.lines = got;
             } catch (e) { log(`listen between ERR: ${e.message}`); }
           }
-          pendingSheet = s; void drain();
+          pendingSheet = s;
         }
       } catch (e) { log(`take ERR: ${e.message}`); }
       void drain();
@@ -632,7 +625,7 @@ export async function apply(ctx) {
 
   // 初始化：先读焦点与 pet 状态，再决定是否启动；最后才注册定时器，避免首个 tick 竞态。
   if (pauseOnFocus) dshFocused = focusState();
-  const init = await checkPet(ctx);
+  const init = await checkPet(ctx, webServer);
   petAlive = init.up; petBase = init.base;
   lastPetCheck = Date.now();
   log(`initial pet: ${petAlive ? 'ONLINE' : 'OFFLINE'} dshFocused=${dshFocused}`);
