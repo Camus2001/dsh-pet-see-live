@@ -26,7 +26,6 @@ function dshHome() {
   return process.env.DSH_HOME || join(homedir(), '.dsh');
 }
 const PET_DIR = join(dshHome(), 'dsh-pet');
-const PET_LOG = join(PET_DIR, 'logs.txt');
 const WATCH_LOG = join(PET_DIR, 'screen-watch.log');
 const SELF_LOG = join(PET_DIR, 'see-live-plugin.log');
 const SEE_NOW_CFG = join(dshHome(), 'see-now.json');
@@ -82,11 +81,17 @@ const FOCUS_SCRIPT = [
   "    print('0')",
 ].join('\n');
 
-/** 取 see-now 配置里用的 Python 解释器（listenPython 优先，其次 python），没有则用 PATH。 */
+// 正规接口：直接复用 see-now 自己的 findListenPython——它统一处理 DSH_SEE_PYTHON /
+// DSH_FLOAT_PYTHON / see-window.json / PATH 的优先级，并实际探测解释器能否启动。
+// 这样 see-now 改了查找规则，本插件自动跟随；不再自己读 see-window.json 猜路径。
+let findListenPython = null;
+let cachedPython;
 function resolvePython() {
-  let cfg = {};
-  try { cfg = JSON.parse(readFileSync(join(dshHome(), 'see-window.json'), 'utf8')) ?? {}; } catch { /* 用回退 */ }
-  return cfg.listenPython || cfg.python || (platform() === 'win32' ? 'python' : 'python3');
+  if (cachedPython !== undefined) return cachedPython;
+  let py = null;
+  try { py = findListenPython?.() ?? null; } catch { /* 探测失败走回退 */ }
+  cachedPython = py || (platform() === 'win32' ? 'python' : 'python3');
+  return cachedPython;
 }
 
 /**
@@ -151,7 +156,7 @@ let LISTEN_DEFAULTS = null;
 try {
   const require = createRequire(import.meta.url);
   const pkg = require.resolve('dsh-see-now/package.json');
-  ({ createListener } = await import(
+  ({ createListener, findListenPython } = await import(
     pathToFileURL(join(dirname(pkg), 'src', 'listen.js')).href
   ));
   ({ LISTEN_DEFAULTS } = await import(
@@ -227,22 +232,19 @@ function resolveFfmpeg() {
   return name;
 }
 
-function findPort() {
-  try {
-    const tail = readFileSync(PET_LOG, 'utf8').split(/\r?\n/).slice(-400);
-    let port = null;
-    for (const line of tail) {
-      const m = line.match(/config:\s*http:\/\/127\.0\.0\.1:(\d+)\/dsh-pet-7340\/config/);
-      if (m) port = m[1];
-    }
-    return port;
-  } catch { return null; }
-}
+// 正规接口：pet 的 HTTP 路由挂在 DSH 的 webServer 上，端口直接读它暴露的 port。
+// dsh-pet 自己也用 ctx.webServer.port（见其 app.js），不再解析 logs.txt 里的 config 行。
+let webServer = null;
 
 /** pet 是否在：端口可达即 pet 开着（跨平台，不查进程）。 */
-async function checkPet() {
-  const port = findPort();
-  if (!port) return { up: false, base: null };
+async function checkPet(ctx) {
+  let ws = webServer;
+  if (!ws && ctx) {
+    // 注入回调可能晚于首次检查；ctx.webServer 未注入时 getter 会抛，吞掉即可。
+    try { ws = ctx.webServer ?? null; } catch { /* 服务还没就绪 */ }
+  }
+  const port = typeof ws?.port === 'number' ? ws.port : 0;
+  if (!port || port <= 0) return { up: false, base: null };
   const base = `http://127.0.0.1:${port}/dsh-pet-7340`;
   try {
     const ctrl = new AbortController();
@@ -259,6 +261,7 @@ function installSettingsApi(ctx) {
   if (!ctx?.inject) return;
   try {
     ctx.inject(['webServer'], (scoped) => {
+      webServer = scoped.webServer;   // 捕获 DSH 注入的 webServer，供 checkPet 读取端口
       scoped.effect(() => scoped.webServer.register({
         kind: 'prefix', path: API_PREFIX, auth: 'required',
         handler: (req, res) => { void handleSettingsRequest(req, res); },
@@ -589,7 +592,7 @@ export async function apply(ctx) {
       const focusP = (pauseOnFocus && now - lastFocusCheck >= 2000 && !focusCheckInFlight)
         ? (() => { lastFocusCheck = now; focusCheckInFlight = true; return checkDshFocus(); })()
         : null;
-      const petP = (now - lastPetCheck >= 2000) ? checkPet() : null;
+      const petP = (now - lastPetCheck >= 2000) ? checkPet(ctx) : null;
       const [focused, pet] = await Promise.all([
         focusP ?? Promise.resolve(null),
         petP ?? Promise.resolve(null),
@@ -633,7 +636,7 @@ export async function apply(ctx) {
 
   // 初始化：先读焦点与 pet 状态，再决定是否启动；最后才注册定时器，避免首个 tick 竞态。
   if (pauseOnFocus) dshFocused = await checkDshFocus();
-  const init = await checkPet();
+  const init = await checkPet(ctx);
   petAlive = init.up; petBase = init.base;
   lastPetCheck = Date.now(); lastFocusCheck = Date.now();
   log(`initial pet: ${petAlive ? 'ONLINE' : 'OFFLINE'} dshFocused=${dshFocused}`);
