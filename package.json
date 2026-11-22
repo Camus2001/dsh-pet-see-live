@@ -1,6 +1,6 @@
 {
   "name": "dsh-pet-see-live",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Let dsh-pet see your screen live and comment on it, using dsh-see-now's capture pipeline. Follows dsh lifecycle; pauses when pet is closed.",
   "type": "module",
   "license": "Apache-2.0",

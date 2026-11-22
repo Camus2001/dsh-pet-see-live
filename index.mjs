@@ -3,16 +3,18 @@
  *
  * 本插件只做一件事：把 dsh-see-now 出的图接到 dsh-pet 的 /chat。
  * 采集/拼图/节奏/档位等一切参数都跟随 see-now 自身的设置
- * （~/.dsh/see-now.json 的 defaultPace / fps，以及 see-now 内置的 PACES/SIZES），
- * 插件本身不提供任何独立变量。
+ * （~/.dsh/see-now.json 的 defaultPace / fps / tier* / maxCrop 等，以及 see-now 内置的
+ * PACES/SIZES），插件本身不提供任何独立变量。与 see-now 一样，改设置后要重启 DSH 生效。
  *
  * 生命周期：随 dsh 加载/卸载；pet 关闭时自动停采集，pet 再开自动恢复。
  * 跨平台：Windows / macOS / Linux，不依赖 PowerShell / curl。
  */
 import { spawn } from 'node:child_process';
 import { readFileSync, appendFileSync, existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { homedir, platform } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 // 路径全部从 DSH_HOME / home 动态解析
 function dshHome() {
@@ -39,13 +41,55 @@ try {
   log(`disabled: dsh-see-now not available (${e.message}). Install it first.`);
 }
 
-/** 读 see-now 自己的配置（节奏 / fps），没有就用 see-now 的默认值。 */
+// see-now 的设置读取器：与它自己的设置页共用同一份校验逻辑。
+// `dsh-see-now` 的 exports 没有暴露 `./tuning`，所以从包根定位 `src/tuning.js`。
+// 缺失时退回只读 see-now.json 的旧路径（至少 pace / fps 仍可用）。
+let readSeeNowTuning = null;
+try {
+  const require = createRequire(import.meta.url);
+  const pkg = require.resolve('dsh-see-now/package.json');
+  ({ readTuning: readSeeNowTuning } = await import(
+    pathToFileURL(join(dirname(pkg), 'src', 'tuning.js')).href
+  ));
+} catch (e) {
+  log(`tuning reader unavailable (${e.message}); only defaultPace/fps will follow see-now`);
+}
+
+/** 读 see-now 自己的配置（节奏 / fps / 档位参数），没有就用 see-now 的默认值。 */
 function seeNowSettings() {
+  let tuning = null;
+  if (readSeeNowTuning) {
+    try {
+      tuning = readSeeNowTuning();
+      if (Array.isArray(tuning.warnings) && tuning.warnings.length > 0) {
+        log(`see-now tuning warnings: ${tuning.warnings.join('; ')}`);
+      }
+    } catch (e) {
+      log(`readTuning failed: ${e.message}`);
+      tuning = null;
+    }
+  }
   let raw = {};
   try { raw = JSON.parse(readFileSync(SEE_NOW_CFG, 'utf8')); } catch { /* 用默认 */ }
-  const pace = PACES[raw.defaultPace] ? raw.defaultPace : DEFAULT_PACE;
-  const fps = Number.isFinite(Number(raw.fps)) && Number(raw.fps) > 0 ? Number(raw.fps) : 12;
-  return { pace, fps, p: PACES[pace] };
+  const paceName = tuning?.defaultPace ?? raw.defaultPace;
+  const pace = PACES[paceName] ? paceName : DEFAULT_PACE;
+  const fpsRaw = Number(tuning?.fps ?? raw.fps);
+  const fps = Number.isFinite(fpsRaw) && fpsRaw > 0 ? fpsRaw : 12;
+  return { pace, fps, p: PACES[pace], tuning };
+}
+
+/** see-now 设置页里能落到 pipeline 的项：tierStyle 在 pipeline 里叫 strategy。 */
+function pipelineTuningOf(tuning) {
+  if (!tuning) return {};
+  return {
+    strategy: tuning.tierStyle,
+    tierMap: tuning.tierMap,
+    tierMode: tuning.tierMode,
+    tierCurve: tuning.tierCurve,
+    tierThresholds: tuning.tierThresholds,
+    scoreNormalize: tuning.scoreNormalize,
+    maxCrop: tuning.maxCrop,
+  };
 }
 
 /** 找 ffmpeg：优先 DSH 自带，再 PATH。跨平台。 */
@@ -137,11 +181,15 @@ export async function apply(ctx) {
     log('apply: skipped (dsh-see-now missing)');
     return () => {};
   }
-  const { pace, fps, p } = seeNowSettings();
+  const { pace, fps, p, tuning } = seeNowSettings();
   const [width, height] = SIZES[DEFAULT_QUALITY];
   const wakeGapMs = p.wakeGapSec * 1000;   // see-now 自己的"多久叫醒一次"
   const ffmpegPath = resolveFfmpeg();
-  log(`apply: pace=${pace} fps=${fps} ${width}x${height} wakeGap=${wakeGapMs}ms ffmpeg=${ffmpegPath}`);
+  log(
+    `apply: pace=${pace} fps=${fps} ${width}x${height} wakeGap=${wakeGapMs}ms`
+      + ` tier=${tuning ? `${tuning.tierStyle}/${tuning.tierMode}/${tuning.tierCurve}` : 'defaults'}`
+      + ` ffmpeg=${ffmpegPath}`,
+  );
 
   let disposed = false;
   let petAlive = false;
@@ -156,11 +204,12 @@ export async function apply(ctx) {
   let backoffUntil = 0;
   let consecutiveFails = 0;
 
-  // 出图参数全部来自 see-now 的 pace（cutAbs + pipeline.*），分辨率用 see-now 默认档
+  // 出图参数全部来自 see-now：pace 管 cutAbs / 兜底节奏，设置页的档位参数走 tuning
   const pipeline = createPipeline({
     width, height, fps,
     cutAbs: p.cutAbs,
     ...p.pipeline,
+    ...pipelineTuningOf(tuning),
   });
 
   function startCapture() {

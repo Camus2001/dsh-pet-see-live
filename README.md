@@ -29,10 +29,13 @@ node scripts/install-dev.mjs
 
 ## 参数跟随 see-now
 
-本插件只做桥接，本身**没有任何独立配置项**。采集的分辨率、帧率、出图节奏（pace）与间隔，全部取自你已有的 see-now 设置：
+本插件只做桥接，本身**没有任何独立配置项**。采集的分辨率、帧率、出图节奏（pace）与拼图参数，全部取自你已有的 see-now 设置：
 
-- 节奏档位、fps、各种阈值 → `~/.dsh/see-now.json`（see-now 的用户配置），没有则用 see-now 内置默认值
-- 分辨率档位、出图参数 → see-now 内置的 `SIZES` / `PACES`
+- 节奏档位、fps → `~/.dsh/see-now.json`（see-now 的用户配置），没有则用 see-now 内置默认值
+- 设置页的拼图参数 → `tierStyle`（每帧大小）、`tierMap`、`tierMode`、`tierCurve`、`tierThresholds`、`scoreNormalize`、`maxCrop` 会传给 pipeline，和 see-now 自己的工具路径一致
+- 分辨率档位 → see-now 内置的 `SIZES`，目前固定 `low`（798×450，带音轨条 798×462）
+
+与 see-now 一样，设置页改动**重启 DSH 后生效**。仍不适用于 pet 这条链路的：`quality`（采集清晰度，固定 low）、`wakeBatch` / `imageTrigger` / `imageKeep`（see-now 常驻循环的省图逻辑）、`idleStopMin` / `maxAutonomousWakes`、`listen`（音频/转写）。
 
 想让 pet 看得更勤或更省，改 see-now 的配置即可，不用动本插件。
 
