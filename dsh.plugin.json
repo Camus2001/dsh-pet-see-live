@@ -1,7 +1,7 @@
 {
   "name": "dsh-pet-see-live",
   "description": "Real-time screen watching for dsh-pet, following dsh lifecycle.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "entry": {
     "name": "dsh-pet-see-live",
     "inject": ["webServer"]

@@ -41,7 +41,7 @@ function log(line) {
 }
 
 // DSH 是否处于系统前台：插件跑在纯 Node（非 Electron 主进程），拿不到 BrowserWindow，
-// 只能用 Python ctypes 调 Win32 GetForegroundWindow。识别 DSH 主程序进程名或桌宠窗口标题。
+// 只能用 Python ctypes 调 Win32 GetForegroundWindow。只识别 DSH 主程序进程名（桌宠窗口不算聚焦）。
 // 注意 64 位句柄必须设 restype=c_void_p，且 OpenProcess 后必须 CloseHandle，否则句柄泄漏。
 const FOCUS_SCRIPT = [
   'import ctypes, sys, os',
@@ -50,9 +50,6 @@ const FOCUS_SCRIPT = [
   '    u.GetForegroundWindow.restype = ctypes.c_void_p',
   '    u.GetForegroundWindow.argtypes = []',
   '    u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]',
-  '    u.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]',
-  '    u.GetWindowTextLengthW.restype = ctypes.c_int',
-  '    u.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]',
   '    k.OpenProcess.restype = ctypes.c_void_p',
   '    k.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]',
   '    k.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]',
@@ -71,11 +68,7 @@ const FOCUS_SCRIPT = [
   "        exe = os.path.basename(buf.value) if ok else ''",
   '    finally:',
   '        k.CloseHandle(h)',
-  '    n = u.GetWindowTextLengthW(hwnd)',
-  '    tbuf = ctypes.create_unicode_buffer(n + 1)',
-  '    u.GetWindowTextW(hwnd, tbuf, n + 1)',
-  '    title = tbuf.value',
-  "    hit = exe.lower() == 'deepseek harness.exe' or title.lower().startswith('dsh-pet')",
+  "    hit = exe.lower() == 'deepseek harness.exe'",
   "    print('1' if hit else '0')",
   'except Exception:',
   "    print('0')",
@@ -95,7 +88,7 @@ function resolvePython() {
 }
 
 /**
- * 前台窗口是不是 DSH（主程序或桌宠）。非 Windows 优雅降级为 false（不暂停）。
+ * 前台窗口是不是 DSH 主程序（桌宠窗口不算）。非 Windows 优雅降级为 false（不暂停）。
  * spawn 没有 timeout 选项，用 setTimeout kill 并只 resolve 一次。
  */
 async function checkDshFocus() {

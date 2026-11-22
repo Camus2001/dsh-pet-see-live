@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
       listen: '语音识别（听同期声音）',
       listenHint: '开启后复用 see-now 的音频采集，识别也沿用 see-now 设置页的转写后端（宿主 SenseVoice 或 ~/.dsh/asr.json），pet 会把听到的话和画面一起点评。Windows 需 numpy + pyaudiowpatch。',
       pauseOnFocus: 'DSH 聚焦时暂停识别',
-      pauseOnFocusHint: '开启后，当 DSH 主窗口或桌宠窗口处于系统前台时自动暂停抓屏与听音，焦点离开后恢复。仅 Windows 生效。',
+      pauseOnFocusHint: '开启后，当 DSH 主窗口处于系统前台时自动暂停抓屏与听音，焦点离开后恢复（桌宠窗口不算）。仅 Windows 生效。',
       restart: '改动需重启 DSH 后生效。',
       saving: '保存中…',
       saved: '已保存',
