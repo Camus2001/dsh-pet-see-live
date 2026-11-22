@@ -40,81 +40,12 @@ function log(line) {
   try { appendFileSync(SELF_LOG, s, 'utf8'); } catch { /* ignore */ }
 }
 
-// DSH 是否处于系统前台：插件跑在纯 Node（非 Electron 主进程），拿不到 BrowserWindow，
-// 只能用 Python ctypes 调 Win32 GetForegroundWindow。只识别 DSH 主程序进程名（桌宠窗口不算聚焦）。
-// 注意 64 位句柄必须设 restype=c_void_p，且 OpenProcess 后必须 CloseHandle，否则句柄泄漏。
-const FOCUS_SCRIPT = [
-  'import ctypes, sys, os',
-  'try:',
-  '    u = ctypes.windll.user32; k = ctypes.windll.kernel32',
-  '    u.GetForegroundWindow.restype = ctypes.c_void_p',
-  '    u.GetForegroundWindow.argtypes = []',
-  '    u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]',
-  '    k.OpenProcess.restype = ctypes.c_void_p',
-  '    k.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]',
-  '    k.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]',
-  '    k.CloseHandle.argtypes = [ctypes.c_void_p]',
-  '    hwnd = u.GetForegroundWindow()',
-  '    if not hwnd:',
-  "        print('0'); sys.exit(0)",
-  '    pid = ctypes.c_ulong()',
-  '    u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))',
-  '    h = k.OpenProcess(0x1000, False, pid.value)',
-  '    if not h:',
-  "        print('0'); sys.exit(0)",
-  '    try:',
-  '        buf = ctypes.create_unicode_buffer(32768); size = ctypes.c_ulong(32768)',
-  '        ok = k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))',
-  "        exe = os.path.basename(buf.value) if ok else ''",
-  '    finally:',
-  '        k.CloseHandle(h)',
-  "    hit = exe.lower() == 'deepseek harness.exe'",
-  "    print('1' if hit else '0')",
-  'except Exception:',
-  "    print('0')",
-].join('\n');
-
-// 正规接口：直接复用 see-now 自己的 findListenPython——它统一处理 DSH_SEE_PYTHON /
-// DSH_FLOAT_PYTHON / see-window.json / PATH 的优先级，并实际探测解释器能否启动。
-// 这样 see-now 改了查找规则，本插件自动跟随；不再自己读 see-window.json 猜路径。
-let findListenPython = null;
-let cachedPython;
-function resolvePython() {
-  if (cachedPython !== undefined) return cachedPython;
-  let py = null;
-  try { py = findListenPython?.() ?? null; } catch { /* 探测失败走回退 */ }
-  cachedPython = py || (platform() === 'win32' ? 'python' : 'python3');
-  return cachedPython;
-}
-
-/**
- * 前台窗口是不是 DSH 主程序（桌宠窗口不算）。非 Windows 优雅降级为 false（不暂停）。
- * spawn 没有 timeout 选项，用 setTimeout kill 并只 resolve 一次。
- */
-async function checkDshFocus() {
-  if (platform() !== 'win32') return false;
-  return new Promise((resolve) => {
-    let settled = false;
-    let out = '';
-    let child;
-    const done = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    try {
-      child = spawn(resolvePython(), ['-c', FOCUS_SCRIPT], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-    } catch (e) {
-      log(`focus detect spawn failed: ${e.message}`);
-      return resolve(false);
-    }
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ } done(false); }, 2000);
-    child.stdout?.on('data', (d) => { out += d.toString(); });
-    child.on('error', () => done(false));
-    child.on('close', () => done(out.trim().split(/\r?\n/).pop()?.trim() === '1'));
-  });
-}
+// 前台信号由渲染端给：client.js 监听窗口 focus/blur 与 visibilitychange，事件变化立刻上报，
+// 之后每 15s 一次心跳；宿主侧 30s 收不到心跳就当作"不可信"，一律按不在前台处理（保持抓屏），
+// 这样渲染端崩溃 / 页面重载时最多退化成"不暂停"，不会把采集永久卡住。
+const FOCUS_FRESH_MS = 30_000;
+let focusReport = null;
+let focusSeen = false;
 
 // see-now 的节奏/档位定义（捕获异常：缺失时优雅禁用）
 let spawnFrames, createPipeline, PACES, SIZES, DEFAULT_PACE, DEFAULT_QUALITY;
@@ -149,7 +80,7 @@ let LISTEN_DEFAULTS = null;
 try {
   const require = createRequire(import.meta.url);
   const pkg = require.resolve('dsh-see-now/package.json');
-  ({ createListener, findListenPython } = await import(
+  ({ createListener } = await import(
     pathToFileURL(join(dirname(pkg), 'src', 'listen.js')).href
   ));
   ({ LISTEN_DEFAULTS } = await import(
@@ -308,6 +239,24 @@ async function handleSettingsRequest(req, res) {
       send(200, { ok: true, ...readPetSeeConfig() });
       return;
     }
+    if (req.method === 'POST' && url.pathname === `${API_PREFIX}/focus`) {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      let body = {};
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+      catch { send(400, { ok: false, reason: 'bad-json' }); return; }
+      if (typeof body?.focused !== 'boolean') {
+        send(400, { ok: false, reason: 'bad-config' });
+        return;
+      }
+      focusReport = { focused: body.focused, at: Date.now() };
+      if (!focusSeen) {
+        focusSeen = true;
+        log(`focus signal from renderer: ${body.focused ? 'focused' : 'blurred'}`);
+      }
+      send(200, { ok: true });
+      return;
+    }
     send(404, { ok: false, reason: 'not-found' });
   } catch (e) {
     send(500, { ok: false, reason: e.message });
@@ -352,11 +301,61 @@ function linesBlock(lines) {
   return `\n【屏幕同期语音（按时间顺序）】：${texts.join(' / ')}。结合画面和这些话一起评价。`;
 }
 
+/** 桌宠 /chat 对 attachment.data 的 base64 上限（对应 dsh-pet 的 MAX_BASE64_CHARS）。 */
+const PET_MAX_B64 = Number(process.env.DSH_PET_MAX_B64 || 900_000);
+
+/** PNG → JPEG：桌宠接受 image/jpeg，q=4 时 798×450 的截图通常只有原 PNG 的四分之一体积。 */
+function pngToJpeg(png, ffmpegPath) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(ffmpegPath, [
+        '-hide_banner', '-v', 'error',
+        '-f', 'image2pipe', '-i', 'pipe:0',
+        '-frames:v', '1', '-q:v', '4',
+        '-f', 'image2pipe', 'pipe:1',
+      ], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+    } catch (e) { reject(e); return; }
+    const out = [];
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* ignore */ }
+      reject(new Error('jpeg timeout'));
+    }, 10_000);
+    child.stdout?.on('data', (d) => out.push(d));
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && out.length > 0) resolve(Buffer.concat(out));
+      else reject(new Error(`ffmpeg exit ${code}`));
+    });
+    child.stdin?.on('error', () => { /* 进程提前退出会 EPIPE，留给 close 判定 */ });
+    child.stdin?.end(png);
+  });
+}
+
+/** 按桌宠的上限挑一个能发出去的附件；JPEG 也放不下就返回 null（调用方跳过这张，不算失败）。 */
+async function fitAttachment(png, ffmpegPath) {
+  const pngB64 = png.toString('base64');
+  if (pngB64.length <= PET_MAX_B64) return { mediaType: 'image/png', data: pngB64 };
+  const jpg = await pngToJpeg(png, ffmpegPath).catch((e) => {
+    log(`jpeg encode failed: ${e.message}`);
+    return null;
+  });
+  if (jpg) {
+    const jpgB64 = jpg.toString('base64');
+    if (jpgB64.length <= PET_MAX_B64) return { mediaType: 'image/jpeg', data: jpgB64 };
+  }
+  log(`attachment too large after jpeg: pngB64=${pngB64.length}`);
+  return null;
+}
+
 /** 把一张图喂给 pet（Node 原生 fetch，无 curl 依赖）。externalSignal 用于失焦时取消在途请求。 */
-async function postImage(base, sheet, externalSignal) {
+async function postImage(base, sheet, externalSignal, ffmpegPath) {
+  const attachment = await fitAttachment(sheet.png, ffmpegPath);
+  if (!attachment) return { skipped: true };
   const payload = JSON.stringify({
     text: sheetPrompt(sheet),
-    attachment: { mediaType: 'image/png', data: sheet.png.toString('base64') },
+    attachment,
   });
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 120000);
@@ -422,8 +421,6 @@ export async function apply(ctx) {
   let lastWallTo = 0;
   // 焦点状态：DSH 前台时暂停识图识音
   let dshFocused = false;
-  let lastFocusCheck = 0;
-  let focusCheckInFlight = false;
   // 听音细节全部沿用 see-now：listen 段直接来自它的 tuning（prefer / live / silence / maxSeg…）
   const listenCfg = {
     ...(LISTEN_DEFAULTS || {}),
@@ -432,17 +429,29 @@ export async function apply(ctx) {
 
   const canRun = () => petAlive && !dshFocused && !disposed;
 
+  /** 渲染端心跳新鲜才采信；过期视为"不在前台"。 */
+  const focusState = () => {
+    if (!focusReport || Date.now() - focusReport.at > FOCUS_FRESH_MS) return false;
+    return focusReport.focused === true;
+  };
+
   // 出图参数全部来自 see-now：pace 管 cutAbs / 兜底节奏，设置页的档位参数走 tuning
-  const pipeline = createPipeline({
+  const pipelineOpts = {
     width, height, fps,
     cutAbs: p.cutAbs,
     ...p.pipeline,
     ...pipelineTuningOf(tuning),
-  });
+  };
+  let pipeline = createPipeline(pipelineOpts);
 
   function startCapture() {
     if (captureOn || disposed || dshFocused) return;
     try {
+      // 每次重开 ffmpeg，帧时间戳都从 0 重来；pipeline 里的 lastCut / lastBound / sheetStart
+      // 还是上一轮的秒数，时间轴回退后所有判据都不成立，会一直不出图。
+      // 重建一根新管子：状态与时间轴一起归零，顺带丢掉上一轮的半成品。
+      pipeline = createPipeline(pipelineOpts);
+      pendingSheet = null;
       ffmpeg = spawnFrames({
         source: { kind: 'screen' }, width, height, fps, ffmpegPath,
         onFrame: (f) => pipeline.push(f), onStderr: null,
@@ -546,7 +555,12 @@ export async function apply(ctx) {
     const ac = new AbortController();
     drainAbort = ac;
     try {
-      const { status, body } = await postImage(petBase, sheet, ac.signal);
+      const { status, body, skipped } = await postImage(petBase, sheet, ac.signal, ffmpegPath);
+      if (skipped) {
+        // 图放不下就没发请求：不进退避、不更新 lastSentAt，下一张照常试
+        log(`SKIP sheet@${sheet.at}s why=${sheet.why} (attachment over ${PET_MAX_B64} b64 chars)`);
+        return;
+      }
       // dsh-pet 的 /chat 用 okResult/failResult 包装，成功与失败都是 HTTP 200，
       // 区别只在 body 的 ok 字段。这里必须解 body，否则限流/超时会被当成成功继续喂图。
       let bodyOk = true;
@@ -581,19 +595,8 @@ export async function apply(ctx) {
     inTick = true;
     try {
       const now = Date.now();
-      // 焦点检查放最前，且与 checkPet 并发，避免慢查询延迟暂停
-      const focusP = (pauseOnFocus && now - lastFocusCheck >= 2000 && !focusCheckInFlight)
-        ? (() => { lastFocusCheck = now; focusCheckInFlight = true; return checkDshFocus(); })()
-        : null;
-      const petP = (now - lastPetCheck >= 2000) ? checkPet(ctx) : null;
-      const [focused, pet] = await Promise.all([
-        focusP ?? Promise.resolve(null),
-        petP ?? Promise.resolve(null),
-      ]);
-      if (focusCheckInFlight && focusP) {
-        focusCheckInFlight = false;
-        if (focused !== null) setFocused(focused);
-      }
+      if (pauseOnFocus) setFocused(focusState());
+      const pet = (now - lastPetCheck >= 2000) ? await checkPet(ctx) : null;
       if (pet) {
         lastPetCheck = Date.now();
         petBase = pet.base;
@@ -628,10 +631,10 @@ export async function apply(ctx) {
   }
 
   // 初始化：先读焦点与 pet 状态，再决定是否启动；最后才注册定时器，避免首个 tick 竞态。
-  if (pauseOnFocus) dshFocused = await checkDshFocus();
+  if (pauseOnFocus) dshFocused = focusState();
   const init = await checkPet(ctx);
   petAlive = init.up; petBase = init.base;
-  lastPetCheck = Date.now(); lastFocusCheck = Date.now();
+  lastPetCheck = Date.now();
   log(`initial pet: ${petAlive ? 'ONLINE' : 'OFFLINE'} dshFocused=${dshFocused}`);
   if (canRun()) { startCapture(); void startListen(); }
   const ticker = setInterval(() => { void tick(); }, 1000);

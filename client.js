@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
       listen: '语音识别（听同期声音）',
       listenHint: '开启后复用 see-now 的音频采集，识别也沿用 see-now 设置页的转写后端（宿主 SenseVoice 或 ~/.dsh/asr.json），pet 会把听到的话和画面一起点评。Windows 需 numpy + pyaudiowpatch。',
       pauseOnFocus: 'DSH 聚焦时暂停识别',
-      pauseOnFocusHint: '开启后，当 DSH 主窗口处于系统前台时自动暂停抓屏与听音，焦点离开后恢复（桌宠窗口不算）。仅 Windows 生效。',
+      pauseOnFocusHint: '开启后，当 DSH 主窗口处于系统前台时自动暂停抓屏与听音，焦点离开后恢复（桌宠窗口不算）。由窗口焦点事件判定，DSH 界面没打开时不会暂停。',
       restart: '改动需重启 DSH 后生效。',
       saving: '保存中…',
       saved: '已保存',
@@ -116,7 +116,39 @@ window.__ModuleLoader__.load({
       );
     }
 
+    const FOCUS_BEAT_MS = 15000;
+
+    // 把 DSH 主窗口是否在前台报给宿主：focus/blur/visibilitychange 立刻上报，之后每 15s 心跳，
+    // 宿主 30s 收不到就按"不在前台"处理。
+    function startFocusReporting(ctx) {
+      let stopped = false;
+      let timer = null;
+      const post = (focused) => {
+        if (stopped) return;
+        fetch(`${API}/focus`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ focused }),
+        }).catch(() => { /* 宿主没挂上或鉴权失败时别刷错误 */ });
+      };
+      const report = () => post(document.hasFocus() === true);
+      window.addEventListener('focus', report);
+      window.addEventListener('blur', report);
+      document.addEventListener('visibilitychange', report);
+      report();
+      timer = setInterval(report, FOCUS_BEAT_MS);
+      const stop = () => {
+        stopped = true;
+        clearInterval(timer);
+        window.removeEventListener('focus', report);
+        window.removeEventListener('blur', report);
+        document.removeEventListener('visibilitychange', report);
+      };
+      try { ctx.effect?.(() => stop); } catch { /* 老宿主没有 effect 就随页面卸载 */ }
+    }
+
     function apply(ctx) {
+      startFocusReporting(ctx);
       ctx.slots.inject('settings.section', () => ctx.slots.register(
         {
           name: 'settings.section',
