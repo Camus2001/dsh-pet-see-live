@@ -1,12 +1,13 @@
 {
   "name": "dsh-pet-see-live",
-  "version": "0.2.0",
-  "description": "Let dsh-pet see your screen live and comment on it, using dsh-see-now's capture pipeline. Follows dsh lifecycle; pauses when pet is closed.",
+  "version": "0.3.0",
+  "description": "Let dsh-pet see your screen and hear live audio, then comment on it, using dsh-see-now's capture pipeline. Follows dsh lifecycle; pauses when pet is closed.",
   "type": "module",
   "license": "Apache-2.0",
   "main": "index.mjs",
   "exports": {
-    ".": "./index.mjs"
+    ".": "./index.mjs",
+    "./client": "./client.js"
   },
   "engines": {
     "node": ">=20"
@@ -22,6 +23,11 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": []
     }
   }
 }

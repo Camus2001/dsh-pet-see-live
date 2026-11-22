@@ -1,12 +1,20 @@
 # dsh-pet-see-live
 
-让你的 dsh-pet **实时看见屏幕并点评**——而不是每隔几分钟一张静止截图。
+让你的 dsh-pet **实时看见屏幕、听见同期声音并点评**——而不是每隔几分钟一张静止截图。
 
-复用 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now) 的采集与拼图管线（逐帧打分、只在画面变化时出图、多帧拼一张省 token），把拼好的图交给 pet 的 `/chat`，pet 就会用气泡 + 语音点评你正在做的事。
+复用 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now) 的采集与拼图管线（逐帧打分、只在画面变化时出图、多帧拼一张省 token）和它的音频 listener（WASAPI 回环采集 + 分段转写），把拼好的图与同期台词一起交给 pet 的 `/chat`，pet 就会用气泡 + 语音点评你正在做的事。
 
 ## 安装
 
 前置：桌面版 DSH，且已装 `dsh-pet` 与 `dsh-see-now`（本插件依赖它们）。
+
+**听音依赖（Windows）**：see-now 的采集脚本需要 `numpy` 与 `pyaudiowpatch`，用 `~/.dsh/see-window.json` 里配置的 Python 解释器安装：
+
+```bash
+python -m pip install numpy pyaudiowpatch
+```
+
+不装也能用：抓屏和点评照常工作，只是听音关闭。see-now 自己的 `DSH_SEE_AUDIO=0` 环境变量仍可随时强制关掉听音。
 
 从 **Releases** 下载源码包（或 `git clone` 本仓库），进入目录后运行：
 
@@ -25,23 +33,43 @@ node scripts/install-dev.mjs
 - **pet 关闭就停**：检测到 pet 的 HTTP 服务不可用时自动停止抓屏；pet 再开自动恢复。
 - **画面变了才看**：静止屏幕几乎不出图；切窗口、滚动、换场景才出图点评。
 - **图集带时间顺序**：发给 pet 的文本会写明每格的编号、相对时刻和整段跨度，pet 按时间先后看，而不是把拼图当成一张静态图。
+- **同期声音一起听**：开启后采集系统正在播放的声音，**用 see-now 的识别设置**转写成台词，按时间窗附到对应图集上，pet 会结合"看到 + 听到"一起点评。
+- **DSH 聚焦就暂停**：当 DSH 主窗口或桌宠窗口处于系统前台时，自动暂停抓屏与听音（并取消在途的点评请求），焦点离开后恢复。基于 Windows 前台窗口检测，仅 Windows 生效；默认开启，可在设置页关掉。
 - **速率保护**：串行发送 + 429 指数退避，不会刷屏。
+
+## 设置界面
+
+DSH 设置里新增 **dsh-pet-see-live** 分区，两个控件：
+
+- **语音识别（听同期声音）**：开 / 关。
+- **DSH 聚焦时暂停识别**：开 / 关，默认开。仅 Windows 生效。
+
+配置落在 `~/.dsh/pet-see-live.json`：
+
+```json
+{ "listenEnabled": false, "pauseOnFocus": true }
+```
+
+改动需**重启 DSH** 生效（和 see-now 一致）。设置只决定这两个开关，其余参数见下一节。
 
 ## 参数跟随 see-now
 
-本插件只做桥接，本身**没有任何独立配置项**。采集的分辨率、帧率、出图节奏（pace）与拼图参数，全部取自你已有的 see-now 设置：
+除设置页里的**语音识别开关**与**聚焦暂停开关**外，其余参数全部取自你已有的 see-now 设置：
 
 - 节奏档位、fps → `~/.dsh/see-now.json`（see-now 的用户配置），没有则用 see-now 内置默认值
-- 设置页的拼图参数 → `tierStyle`（每帧大小）、`tierMap`、`tierMode`、`tierCurve`、`tierThresholds`、`scoreNormalize`、`maxCrop` 会传给 pipeline，和 see-now 自己的工具路径一致
-- 分辨率档位 → see-now 内置的 `SIZES`，目前固定 `low`（798×450，带音轨条 798×462）
+- 拼图参数 → `tierStyle`（每帧大小）、`tierMap`、`tierMode`、`tierCurve`、`tierThresholds`、`scoreNormalize`、`maxCrop` 会传给 pipeline，和 see-now 自己的工具路径一致
+- 分辨率 → 取自 see-now 内置的 `SIZES`
+- 听音细节 → see-now 的 `listen` 对象（`prefer` / `live` / `silence` / `maxSeg` 等），总开关在本插件设置页；**识别走 see-now 自己的 `resolveTranscriber`**（宿主 SenseVoice 或 `~/.dsh/asr.json` 的本地接口），不另做识别配置
 
-与 see-now 一样，设置页改动**重启 DSH 后生效**。仍不适用于 pet 这条链路的：`quality`（采集清晰度，固定 low）、`wakeBatch` / `imageTrigger` / `imageKeep`（see-now 常驻循环的省图逻辑）、`idleStopMin` / `maxAutonomousWakes`、`listen`（音频/转写）。
+与 see-now 一样，设置页改动**重启 DSH 后生效**。仍不适用于 pet 这条链路的：`wakeBatch` / `imageTrigger` / `imageKeep`（see-now 常驻循环的省图逻辑）、`idleStopMin` / `maxAutonomousWakes`。
 
-想让 pet 看得更勤或更省，改 see-now 的配置即可，不用动本插件。
+想让 pet 看得更勤或更省，改 see-now 的配置即可；想改清晰度或开关听音，用本插件设置页。
+
+**关于语音识别**：识别完全沿用 see-now 的设置页，本插件不重复实现。先在 **see-now 设置页**里把识别配好（`prefer` 选宿主 SenseVoice 或本地，本地需在 see-now 设置页填 `~/.dsh/asr.json` 的接口地址/密钥），本插件直接复用同一份配置。若识别没配好，日志里 `listen start` 会给出 `reason`，抓屏点评不受影响。
 
 ## 日志
 
-`~/.dsh/dsh-pet/see-live-plugin.log`（插件运行日志）与 `screen-watch.log`（每次喂图结果）。
+`~/.dsh/dsh-pet/see-live-plugin.log`（插件运行日志，含 `apply:` 的参数快照、`listen start` 与 `[listen]` 采集日志）与 `screen-watch.log`（每次喂图结果）。听音转写失败会记下 see-now 识别后端返回的原因。
 
 ## 卸载
 
