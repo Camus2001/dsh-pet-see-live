@@ -315,24 +315,21 @@ async function handleSettingsRequest(req, res, focus) {
  *
  * 图里每格虽然烧了编号，但只发 PNG 的话模型不知道编号代表什么；
  * see-now 原本会在工具文本里附带 frame@时间码，这里补上同一份信息。
- * 开头固定一段人设/风格约束：ACP 会话被重置后是新会话，没有旧对话里的语气示范，
- * 不写这段它会按 CodeBuddy 的分析口吻分点输出。
+ * 开头标明“来自 dsh-pet”，让 CodeBuddy 的 CODEBUDDY.md 里那条
+ * “当请求来自 dsh-pet 时按桌宠人设回答”的条件能生效。
  */
-const PET_STYLE_PROMPT = '你是主人桌上的 Q 版蓝发小女仆（DeepSeek 大肥鱼），温柔乖巧、带点俏皮。只回一句不超过20字的点评，不要分点、不要 Markdown、不要分析过程。';
+const PET_SOURCE_TAG = '（来自dsh-pet）';
 
 function sheetPrompt(sheet) {
   const frames = Array.isArray(sheet?.frames) ? sheet.frames : [];
   const lines = linesBlock(sheet?.lines);
-  if (frames.length < 2) {
-    return `${PET_STYLE_PROMPT}\n看一眼我现在的屏幕，用简短一句话吐槽或评价，不超过20字。` + lines;
-  }
-  const first = Number(frames[0].t) || 0;
-  const last = Number(frames[frames.length - 1].t) || first;
+  const first = Number(frames[0]?.t) || 0;
+  const last = Number(frames[frames.length - 1]?.t) || first;
   const times = frames
     .map((f, i) => `${i + 1}=+${Math.max(0, (Number(f.t) || 0) - first).toFixed(1)}s`)
     .join('、');
   return [
-    PET_STYLE_PROMPT,
+    PET_SOURCE_TAG,
     `这是一张按时间采样的连拍图集，不是一张静态截图：一共 ${frames.length} 张画面，`
       + `每格左上角的编号 1→${frames.length} 就是真实时间顺序（1 最早，${frames.length} 最晚），`
       + '不要按左右/上下阅读顺序理解。',
