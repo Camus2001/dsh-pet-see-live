@@ -307,28 +307,59 @@ function resolveFfmpeg() {
 
 // 正规接口：pet 的 HTTP 路由挂在 DSH 的 webServer 上，端口直接读它暴露的 port。
 // dsh-pet 自己也用 ctx.webServer.port（见其 app.js），不再解析 logs.txt 里的 config 行。
-/** pet 是否在：端口可达即 pet 开着（跨平台，不查进程）。 */
-async function checkPet(ctx, webServer) {
+/** 取 pet 的 HTTP 基址；webServer 注入晚于首次检查时回退读 ctx.webServer。 */
+function petBaseOf(ctx, webServer) {
   let ws = webServer;
   if (!ws && ctx) {
-    // 注入回调可能晚于首次检查；ctx.webServer 未注入时 getter 会抛，吞掉即可。
     try { ws = ctx.webServer ?? null; } catch { /* 服务还没就绪 */ }
   }
   const port = typeof ws?.port === 'number' ? ws.port : 0;
-  if (!port || port <= 0) return { up: false, base: null };
-  const base = `http://127.0.0.1:${port}/dsh-pet-7340`;
+  return port > 0 ? `http://127.0.0.1:${port}/dsh-pet-7340` : null;
+}
+
+/**
+ * 轻量探活：只打 /config/meta（返回几个路径字符串，不读全量配置），1s 超时。
+ * 与原 /config 方案相比，不再让心跳触发 dsh-pet 读盘 + 合并多层配置 + 解析 JSON；
+ * 也不再占住 tick 的 await 关键路径（超时从 3s 降到 1s，pet 假死最多卡 1s）。
+ */
+async function probePet(ctx, webServer) {
+  const base = petBaseOf(ctx, webServer);
+  if (!base) return { up: false, base: null };
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1000);
+    let r;
+    try { r = await fetch(`${base}/config/meta`, { signal: ctrl.signal }); }
+    finally { clearTimeout(t); }
+    if (!r.ok) return { up: false, base };
+    return { up: true, base };
+  } catch { return { up: false, base, netFail: true }; }
+}
+
+/**
+ * 读宠物目录（顺序 / 人设）：这是"重"操作（全量 /config + JSON 解析），
+ * 只在初始化、pet 从离线变在线、设置页被打开时调用，绝不跟心跳走。
+ */
+async function readPetCatalog(base, signal) {
+  if (!base) return null;
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 3000);
+    const onAbort = () => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
     let r;
     try { r = await fetch(`${base}/config`, { signal: ctrl.signal }); }
-    finally { clearTimeout(t); }
-    let config = null;
-    if (r.ok) {
-      try { config = await r.json(); } catch { /* 非 JSON 不影响在线判定 */ }
+    finally {
+      clearTimeout(t);
+      if (signal) signal.removeEventListener('abort', onAbort);
     }
-    return { up: r.ok, base, config };
-  } catch { return { up: false, base: null, config: null }; }
+    if (!r.ok) return null;
+    const config = await r.json();
+    return petCatalogOf(config);
+  } catch { return null; }
 }
 
 /** 挂设置页用的同源 HTTP API：GET /status、POST /config、POST /clear-acp。 */
@@ -336,7 +367,7 @@ function installSettingsApi(ctx, focus, onWebServer, onConnection, host) {
   if (!ctx?.inject) return;
   try {
     ctx.inject(['webServer'], (scoped) => {
-      onWebServer(scoped.webServer);   // 捕获 DSH 注入的 webServer，供 checkPet 读取端口
+      onWebServer(scoped.webServer);   // 捕获 DSH 注入的 webServer，供探活读取端口
       scoped.effect(() => scoped.webServer.register({
         kind: 'prefix', path: API_PREFIX, auth: 'required',
         handler: (req, res) => { void handleSettingsRequest(req, res, focus, host); },
@@ -601,8 +632,12 @@ export async function apply(ctx) {
   let petCatalog = [];
   const settingsHost = {
     getPets: async () => {
-      const pet = await checkPet(ctx, webServer);
-      if (pet.up && pet.config) petCatalog = petCatalogOf(pet.config);
+      // 设置页打开时才读重端点：先轻量探活，在线再拉目录。
+      const pet = await probePet(ctx, webServer);
+      if (pet.up) {
+        const catalog = await readPetCatalog(pet.base);
+        if (catalog) petCatalog = catalog;
+      }
       return petCatalog;
     },
     clearAcp: async () => clearAcpSession(),
@@ -613,6 +648,10 @@ export async function apply(ctx) {
   let petAlive = false;
   let petBase = null;
   let lastPetCheck = 0;
+  // 自适应探测间隔：在线时 5s（成功发图本身也是心跳，探测只兜底）；离线 2s 快速恢复；
+  // 连续网络失败退避到 10–30s，pet 长期关闭时不空转。
+  let petProbeGap = 2000;
+  let petFailStreak = 0;
   let restartTimer = null;
   let ffmpeg = null;
   let captureOn = false;
@@ -637,6 +676,31 @@ export async function apply(ctx) {
   };
 
   const canRun = () => petAlive && !dshFocused && !disposed;
+
+  /**
+   * 标记 pet 下线并停采集/听音，供 tick 探活与发图网络错误共用（幂等）。
+   * why 只进日志，区分"探测发现关闭"与"发图时发现连接拒绝"。
+   */
+  function markPetOffline(why) {
+    petBase = null;
+    // 探测间隔由调用方决定：tick 的探测失败走退避，发图网络错误走快速探测。
+    if (!petAlive) return;
+    petAlive = false;
+    log(`pet OFFLINE → stop (${why})`);
+    stopCapture();
+    stopListen('pet offline');
+  }
+
+  /**
+   * 网络层失败 = pet 进程/服务没了（fetch 抛错且 cause.code 是连接类错误）。
+   * 与 HTTP 429/500 严格区分：后者是 pet 还活着但限流/出错，只能按宠退避，不能判下线。
+   * ffmpeg 转码失败等其它 Error 没有 cause.code，也不会命中。
+   */
+  function isPetNetworkError(e) {
+    const code = e?.cause?.code;
+    return Boolean(code) && ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN',
+      'ETIMEDOUT', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET'].includes(code);
+  }
 
   /** 渲染端心跳新鲜才采信；过期视为"不在前台"。 */
   const focusState = () => {
@@ -1040,6 +1104,14 @@ export async function apply(ctx) {
             if (dshFocused) log('drain aborted (DSH focused)');
             break;
           }
+          if (isPetNetworkError(e)) {
+            // 连接拒绝/重置 = pet 已关闭：立刻下线停采集，不等下一次心跳发现。
+            log(`chat network error (${e.cause?.code}) → pet offline`);
+            petFailStreak = 0;
+            petProbeGap = 2000;              // 快速探测，pet 重开后能尽快恢复
+            markPetOffline('chat network error');
+            break;
+          }
           petBackoffFor(target.id, `ERR ${e.message}`);
         }
       }
@@ -1054,17 +1126,32 @@ export async function apply(ctx) {
     try {
       const now = Date.now();
       if (pauseOnFocus) setFocused(focusState());
-      const pet = (now - lastPetCheck >= 2000) ? await checkPet(ctx, webServer) : null;
+      const pet = (now - lastPetCheck >= petProbeGap) ? await probePet(ctx, webServer) : null;
       if (pet) {
         lastPetCheck = Date.now();
-        petBase = pet.base;
-        if (pet.config) petCatalog = petCatalogOf(pet.config);
+        // 自适应间隔：网络层失败退避，干净的下线快速探测，在线拉长兜底间隔。
+        if (pet.netFail) {
+          petFailStreak += 1;
+          petProbeGap = Math.min(30000, 2000 * (2 ** Math.min(petFailStreak - 1, 4)));
+        } else if (pet.up) {
+          petFailStreak = 0;
+          petProbeGap = 5000;
+          petBase = pet.base;
+        } else {
+          petFailStreak = 0;
+          petProbeGap = 2000;
+        }
         if (pet.up !== petAlive) {
-          petAlive = pet.up;
           if (pet.up) {
+            // 只在上线这一刻读一次重端点，刷新宠物目录/人设
+            const catalog = await readPetCatalog(pet.base);
+            if (catalog) petCatalog = catalog;
+            petAlive = true;
             if (canRun()) { log('pet ONLINE → start'); startCapture(); void startListen(); }
             else log('pet ONLINE → held (DSH focused)');
-          } else { log('pet OFFLINE → stop'); stopCapture(); stopListen('pet offline'); }
+          } else {
+            markPetOffline('probe');
+          }
         }
       }
       // 失焦期间 DSH 聚焦已暂停抓屏，这里直接返回，不再取帧/喂图
@@ -1091,8 +1178,14 @@ export async function apply(ctx) {
 
   // 初始化：先读焦点与 pet 状态，再决定是否启动；最后才注册定时器，避免首个 tick 竞态。
   if (pauseOnFocus) dshFocused = focusState();
-  const init = await checkPet(ctx, webServer);
-  petAlive = init.up; petBase = init.base;
+  const init = await probePet(ctx, webServer);
+  petAlive = init.up;
+  if (init.up) {
+    petBase = init.base;
+    petProbeGap = 5000;
+    const catalog = await readPetCatalog(init.base);   // 初始化读一次目录
+    if (catalog) petCatalog = catalog;
+  }
   lastPetCheck = Date.now();
   log(`initial pet: ${petAlive ? 'ONLINE' : 'OFFLINE'} dshFocused=${dshFocused}`);
   if (canRun()) { startCapture(); void startListen(); }
