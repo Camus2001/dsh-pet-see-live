@@ -1,6 +1,6 @@
 # dsh-pet-see-live
 
-让你的 dsh-pet **实时看见屏幕、听见同期声音并点评**——而不是每隔几分钟一张静止截图。
+让你的 dsh-pet **实时看见屏幕、听见同期声音并点评**
 
 复用 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now) 的采集与拼图管线（逐帧打分、只在画面变化时出图、多帧拼一张省 token）和它的音频 listener（WASAPI 回环采集 + 分段转写），把拼好的图与同期台词一起交给 pet 的 `/chat`，pet 就会用气泡 + 语音点评你正在做的事。
 
