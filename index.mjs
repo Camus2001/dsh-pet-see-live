@@ -48,6 +48,96 @@ const ACP_AUTH_TTL_MS = 10 * 60_000;            // /connect 拿到的 cookie 复
 const CODEBUDDY_HOME_DIR = process.env.CODEBUDDY_HOME || join(homedir(), '.codebuddy');
 const CODEBUDDY_PROJECTS = join(CODEBUDDY_HOME_DIR, 'projects');
 
+const DEFAULT_COMMENT_STYLE = '自然随意地用短短一句说说你的想法，可以吐槽、夸奖或贬损。';
+
+/** dsh-pet 自带的默认人设（条目级没人设时的最后兜底）。 */
+function readDshPetDefaultPersona() {
+  try {
+    const require = createRequire(import.meta.url);
+    const pkg = require.resolve('dsh-pet/package.json');
+    const file = join(dirname(pkg), 'assets', 'config.jsonc');
+    const text = readFileSync(file, 'utf8');
+    const m = text.match(/^\s*"whisperPrompt"\s*:\s*("(?:[^"\\]|\\.)*")/m);
+    if (!m) return '';
+    return String(JSON.parse(m[1]) || '').trim();
+  } catch (e) {
+    log(`dsh-pet default persona unavailable: ${e.message}`);
+    return '';
+  }
+}
+const DSH_PET_DEFAULT_PERSONA = readDshPetDefaultPersona();
+
+/** 从一份成品 pet config 里取一只宠物的人设：实例 > 条目 > dsh-pet 默认。 */
+function personaOf(entry, pet) {
+  const own = pet?.whisperPrompt;
+  if (typeof own === 'string' && own.trim() !== '') return own.trim();
+  const inherited = entry?.whisperPrompt;
+  if (typeof inherited === 'string' && inherited.trim() !== '') return inherited.trim();
+  return DSH_PET_DEFAULT_PERSONA;
+}
+
+/**
+ * 按 dsh-pet 设置页同样的顺序展开宠物：条目顺序 × 每个条目的 pets 数组顺序。
+ * 返回的数组顺序就是设置页要渲染的顺序。
+ */
+function petCatalogOf(config) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return [];
+  const out = [];
+  for (const [entryKey, entry] of Object.entries(config)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const provider = typeof entry.chatModel?.provider === 'string' ? entry.chatModel.provider : '';
+    const pets = Array.isArray(entry.pets) ? entry.pets : [];
+    for (const pet of pets) {
+      if (!pet || typeof pet !== 'object' || typeof pet.id !== 'string' || pet.id === '') continue;
+      const name = typeof pet.name === 'string' && pet.name.trim() !== '' ? pet.name.trim() : pet.id;
+      out.push({
+        id: pet.id,
+        name,
+        display: typeof pet.display === 'string' ? pet.display : 'desktop',
+        provider,
+        persona: personaOf(entry, pet),
+        entryKey,
+      });
+    }
+  }
+  return out;
+}
+
+/** 把每只宠物的设置并进 catalog，供设置页按顺序渲染。 */
+function withPetSettings(catalog, petSettings) {
+  const settings = petSettings && typeof petSettings === 'object' ? petSettings : {};
+  return (Array.isArray(catalog) ? catalog : []).map((pet) => ({
+    id: pet.id,
+    name: pet.name,
+    provider: pet.provider,
+    display: pet.display,
+    persona: pet.persona,
+    enabled: settings[pet.id]?.enabled === true,
+    commentStyle: typeof settings[pet.id]?.commentStyle === 'string' ? settings[pet.id].commentStyle : '',
+  }));
+}
+
+/** 设置页提交的 pets 补丁：只收 enabled/commentStyle，非法整单拒绝。 */
+function normalizePetsPatch(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const out = {};
+  for (const [id, value] of Object.entries(input)) {
+    if (typeof id !== 'string' || id === '' || id.length > 128) return null;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const next = {};
+    if (Object.hasOwn(value, 'enabled')) {
+      if (typeof value.enabled !== 'boolean') return null;
+      next.enabled = value.enabled;
+    }
+    if (Object.hasOwn(value, 'commentStyle')) {
+      if (typeof value.commentStyle !== 'string' || value.commentStyle.length > 1000) return null;
+      next.commentStyle = value.commentStyle;
+    }
+    out[id] = next;
+  }
+  return out;
+}
+
 /** 删除 CodeBuddy 某个会话的 transcript；返回是否真的删掉了文件。 */
 function deleteCodeBuddyTranscript(acpSessionId) {
   if (typeof acpSessionId !== 'string' || !/^[A-Za-z0-9._-]+$/.test(acpSessionId)) return false;
@@ -124,7 +214,18 @@ function readPetSeeConfig() {
   let raw = {};
   try { raw = JSON.parse(readFileSync(PET_SEE_CFG, 'utf8')); } catch { /* 用默认 */ }
   const threshold = Number(raw.sessionResetThreshold);
+  const pets = {};
+  if (raw.pets && typeof raw.pets === 'object' && !Array.isArray(raw.pets)) {
+    for (const [id, value] of Object.entries(raw.pets)) {
+      if (typeof id !== 'string' || id === '' || !value || typeof value !== 'object') continue;
+      pets[id] = {
+        enabled: value.enabled === true,
+        commentStyle: typeof value.commentStyle === 'string' ? value.commentStyle : '',
+      };
+    }
+  }
   return {
+    pets,
     listenEnabled: raw.listenEnabled === true,
     pauseOnFocus: raw.pauseOnFocus !== false,   // 默认开启
     sessionResetEnabled: raw.sessionResetEnabled === true,
@@ -139,6 +240,7 @@ function writePetSeeConfig(patch) {
   let raw = {};
   try { raw = JSON.parse(readFileSync(PET_SEE_CFG, 'utf8')); } catch { /* 新建 */ }
   const next = { ...raw, ...patch };
+  if (patch.pets) next.pets = { ...(raw.pets && typeof raw.pets === 'object' ? raw.pets : {}), ...patch.pets };
   writeFileSync(PET_SEE_CFG, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
 }
 
@@ -208,19 +310,23 @@ async function checkPet(ctx, webServer) {
     let r;
     try { r = await fetch(`${base}/config`, { signal: ctrl.signal }); }
     finally { clearTimeout(t); }
-    return { up: r.ok, base };
-  } catch { return { up: false, base }; }
+    let config = null;
+    if (r.ok) {
+      try { config = await r.json(); } catch { /* 非 JSON 不影响在线判定 */ }
+    }
+    return { up: r.ok, base, config };
+  } catch { return { up: false, base: null, config: null }; }
 }
 
-/** 挂设置页用的同源 HTTP API：GET /status、POST /config；并把 connection 交给会话重置用。 */
-function installSettingsApi(ctx, focus, onWebServer, onConnection) {
+/** 挂设置页用的同源 HTTP API：GET /status、POST /config、POST /clear-acp。 */
+function installSettingsApi(ctx, focus, onWebServer, onConnection, host) {
   if (!ctx?.inject) return;
   try {
     ctx.inject(['webServer'], (scoped) => {
       onWebServer(scoped.webServer);   // 捕获 DSH 注入的 webServer，供 checkPet 读取端口
       scoped.effect(() => scoped.webServer.register({
         kind: 'prefix', path: API_PREFIX, auth: 'required',
-        handler: (req, res) => { void handleSettingsRequest(req, res, focus); },
+        handler: (req, res) => { void handleSettingsRequest(req, res, focus, host); },
       }, 'dsh-pet-see-live: settings routes'));
     });
   } catch (e) {
@@ -234,7 +340,7 @@ function installSettingsApi(ctx, focus, onWebServer, onConnection) {
   }
 }
 
-async function handleSettingsRequest(req, res, focus) {
+async function handleSettingsRequest(req, res, focus, host) {
   const send = (status, obj) => {
     try {
       res.statusCode = status;
@@ -250,7 +356,10 @@ async function handleSettingsRequest(req, res, focus) {
     }
     const url = new URL(req.url || '/', 'http://127.0.0.1');
     if (req.method === 'GET' && (url.pathname === API_PREFIX || url.pathname === `${API_PREFIX}/status`)) {
-      send(200, { ok: true, ...readPetSeeConfig() });
+      const cfg = readPetSeeConfig();
+      let catalog = [];
+      try { catalog = host?.getPets ? await host.getPets() : []; } catch { /* pet 离线时保留空表 */ }
+      send(200, { ok: true, ...cfg, pets: withPetSettings(catalog, cfg.pets) });
       return;
     }
     if (req.method === 'POST' && url.pathname === `${API_PREFIX}/config`) {
@@ -278,12 +387,30 @@ async function handleSettingsRequest(req, res, focus) {
         if (Number.isFinite(n) && n >= 4096 && n <= 2_000_000) patch.sessionResetThreshold = Math.round(n);
         else bad = true;
       }
+      if (Object.hasOwn(body, 'pets')) {
+        const pets = normalizePetsPatch(body.pets);
+        if (pets === null) bad = true;
+        else patch.pets = pets;
+      }
       if (bad || Object.keys(patch).length === 0) {
         send(400, { ok: false, reason: 'bad-config' });
         return;
       }
       writePetSeeConfig(patch);
-      send(200, { ok: true, ...readPetSeeConfig() });
+      const saved = readPetSeeConfig();
+      let catalog = [];
+      try { catalog = host?.getPets ? await host.getPets() : []; } catch { /* ignore */ }
+      send(200, { ok: true, ...saved, pets: withPetSettings(catalog, saved.pets) });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === `${API_PREFIX}/clear-acp`) {
+      if (!host?.clearAcp) { send(500, { ok: false, reason: 'acp-unavailable' }); return; }
+      try {
+        const r = await host.clearAcp();
+        send(200, { ok: true, ...r });
+      } catch (e) {
+        send(500, { ok: false, reason: e.message });
+      }
       return;
     }
     if (req.method === 'POST' && url.pathname === `${API_PREFIX}/focus`) {
@@ -315,27 +442,30 @@ async function handleSettingsRequest(req, res, focus) {
  *
  * 图里每格虽然烧了编号，但只发 PNG 的话模型不知道编号代表什么；
  * see-now 原本会在工具文本里附带 frame@时间码，这里补上同一份信息。
- * 开头标明“来自 dsh-pet”，让 CodeBuddy 的 CODEBUDDY.md 里那条
- * “当请求来自 dsh-pet 时按桌宠人设回答”的条件能生效。
+ * 人设取 dsh-pet 的 whisperPrompt（含兜底），风格/篇幅取设置页的 per-pet 值。
  */
 const PET_SOURCE_TAG = '（来自dsh-pet）';
 
-function sheetPrompt(sheet) {
+function sheetPrompt(sheet, pet) {
   const frames = Array.isArray(sheet?.frames) ? sheet.frames : [];
-  const lines = linesBlock(sheet?.lines);
+  const lines = linesBlock(sheet?.lines).trim();
   const first = Number(frames[0]?.t) || 0;
   const last = Number(frames[frames.length - 1]?.t) || first;
   const times = frames
     .map((f, i) => `${i + 1}=+${Math.max(0, (Number(f.t) || 0) - first).toFixed(1)}s`)
     .join('、');
+  const persona = typeof pet?.persona === 'string' ? pet.persona.trim() : '';
+  const style = typeof pet?.commentStyle === 'string' && pet.commentStyle.trim() !== ''
+    ? pet.commentStyle.trim()
+    : DEFAULT_COMMENT_STYLE;
   return [
     PET_SOURCE_TAG,
-    `这是一张按时间采样的连拍图集，不是一张静态截图：一共 ${frames.length} 张画面，`
-      + `每格左上角的编号 1→${frames.length} 就是真实时间顺序（1 最早，${frames.length} 最晚），`
-      + '不要按左右/上下阅读顺序理解。',
+    persona,
+    `这是按时间采样的连拍图集，一共 ${frames.length} 张画面，画面左上角的编号 1→${frames.length} 就是真实时间顺序（1 最早，${frames.length} 最晚）。`,
     `每张画面相对第一张的时刻：${times}；整段跨度 ${Math.max(0, last - first).toFixed(1)} 秒。`,
-    '按时间顺序看完，你的想法是什么？',
     lines,
+    '按时间顺序看完（不要调用任何工具）。',
+    style,
   ].filter(Boolean).join('\n');
 }
 
@@ -399,13 +529,15 @@ async function fitAttachment(png, ffmpegPath) {
 }
 
 /** 把一张图喂给 pet（Node 原生 fetch，无 curl 依赖）。externalSignal 用于失焦时取消在途请求。 */
-async function postImage(base, sheet, externalSignal, ffmpegPath) {
+async function postImage(base, sheet, externalSignal, ffmpegPath, target) {
   const attachment = await fitAttachment(sheet.png, ffmpegPath);
   if (!attachment) return { skipped: true };
   const payload = JSON.stringify({
-    text: sheetPrompt(sheet),
+    text: sheetPrompt(sheet, target),
     attachment,
   });
+  const petId = target?.id || 'main';
+  const surface = target?.surface || 'desktop';
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 120000);
   const onAbort = () => ctrl.abort();
@@ -414,7 +546,7 @@ async function postImage(base, sheet, externalSignal, ffmpegPath) {
     else externalSignal.addEventListener('abort', onAbort, { once: true });
   }
   try {
-    const r = await fetch(`${base}/chat?pet=main&surface=desktop`, {
+    const r = await fetch(`${base}/chat?pet=${encodeURIComponent(petId)}&surface=${surface}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
       body: payload,
@@ -453,7 +585,16 @@ export async function apply(ctx) {
   const focus = { report: null, seen: false };
   let webServer = null;
   let connection = null;
-  installSettingsApi(ctx, focus, (ws) => { webServer = ws; }, (c) => { connection = c; });
+  let petCatalog = [];
+  const settingsHost = {
+    getPets: async () => {
+      const pet = await checkPet(ctx, webServer);
+      if (pet.up && pet.config) petCatalog = petCatalogOf(pet.config);
+      return petCatalog;
+    },
+    clearAcp: async () => clearAcpSession(),
+  };
+  installSettingsApi(ctx, focus, (ws) => { webServer = ws; }, (c) => { connection = c; }, settingsHost);
 
   let disposed = false;
   let petAlive = false;
@@ -468,6 +609,10 @@ export async function apply(ctx) {
   let backoffUntil = 0;
   let consecutiveFails = 0;
   let drainAbort = null;
+  // 宠物目录：顺序与 dsh-pet 设置页一致；由 /config 刷新。
+  const petBackoff = new Map();
+  const petFails = new Map();
+  let lastNoTargetWarnAt = 0;
   // 听音状态：随 pet 上下线，与抓屏并行但独立
   let listener = null;
   let listenOn = false;
@@ -679,6 +824,30 @@ export async function apply(ctx) {
       .filter(Boolean);
   }
 
+  /** 关闭目标 ACP 会话并删除 CodeBuddy transcript。 */
+  async function closeAcpSessions(rows, signal) {
+    let meta = [];
+    try {
+      meta = await acpSessionsMeta(signal);
+    } catch { /* 拿不到只影响 transcript 轮换，close 仍然做 */ }
+    const transcripts = new Set();
+    for (const s of rows) {
+      const m = meta.find((v) => v.sessionId === s.sessionId);
+      await acpRpc('session/close', { sessionId: s.sessionId }, signal);
+      // CodeBuddy 会把关闭的会话保留在 transcript 里，下一次 prompt 又加载回来。
+      // 只对 CodeBuddy 删文件；文件不存在时说明本来就没有可恢复的上下文。
+      if (m?.agentId === 'codebuddy' && typeof m.acpSessionId === 'string') transcripts.add(m.acpSessionId);
+    }
+    // 给 agent 一点收尾时间，再删 transcript，避免它把旧内容又写回同一路径。
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    let deleted = 0;
+    for (const id of transcripts) {
+      if (deleteCodeBuddyTranscript(id)) { deleted += 1; log(`session reset: transcript deleted (${id}.jsonl)`); }
+      else log('session reset: transcript not found or delete failed; CodeBuddy may resume the old context');
+    }
+    return { closed: rows.length, transcripts: deleted };
+  }
+
   /**
    * 发图前检查一次：ACP 会话上下文超过阈值就关闭它。
    * 只在当前没有 turn 在跑时动手；失败只记日志，不阻塞本次发图。
@@ -725,22 +894,9 @@ export async function apply(ctx) {
       return false;
     }
 
-    // 先拿 ACP sessionId：close 之后 session/chat-transcript 就查不到了。
-    let meta = [];
-    try {
-      meta = await acpSessionsMeta(signal);
-    } catch { /* 拿不到只影响 transcript 轮换，close 仍然做 */ }
-
     const targets = rows.filter((s) => (Number(s.usage?.used) || 0) >= cfg.sessionResetThreshold);
-    const transcripts = new Set();
     try {
-      for (const s of targets) {
-        const m = meta.find((v) => v.sessionId === s.sessionId);
-        await acpRpc('session/close', { sessionId: s.sessionId }, signal);
-        // CodeBuddy 会把关闭的会话保留在 transcript 里，下一次 prompt 又加载回来。
-        // 只对 CodeBuddy 删文件；文件不存在时说明本来就没有可恢复的上下文。
-        if (m?.agentId === 'codebuddy' && typeof m.acpSessionId === 'string') transcripts.add(m.acpSessionId);
-      }
+      await closeAcpSessions(targets, signal);
     } catch (e) {
       if (e?.name === 'AbortError') return false;
       resetRetryAt = Date.now() + SESSION_RESET_FAIL_COOLDOWN_MS;
@@ -749,13 +905,57 @@ export async function apply(ctx) {
     }
     lastResetAt = Date.now();
     log(`session reset: used=${used} threshold=${cfg.sessionResetThreshold} closed=${targets.length}`);
-    // 给 agent 一点收尾时间，再删 transcript，避免它把旧内容又写回同一路径。
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    for (const id of transcripts) {
-      if (deleteCodeBuddyTranscript(id)) log(`session reset: transcript deleted (${id}.jsonl)`);
-      else log('session reset: transcript not found or delete failed; CodeBuddy may resume the old context');
-    }
     return true;
+  }
+
+  /** 手动清空：不看阈值/开关，直接关闭当前 dsh-pet 会话并删除 transcript。 */
+  async function clearAcpSession() {
+    if (!connection || !webServer?.port) throw new Error('ACP 接口不可用');
+    const list = await acpRpc('session/chat-list', { dshSessionId: 'dsh-pet' });
+    const rows = (Array.isArray(list?.sessions) ? list.sessions : [])
+      .filter((s) => s && typeof s.sessionId === 'string');
+    if (rows.length === 0) return { cleared: 0, transcripts: 0 };
+    const r = await closeAcpSessions(rows);
+    lastResetAt = Date.now();
+    resetRetryAt = 0;
+    log(`acp session cleared (manual) sessions=${r.closed}`);
+    return { cleared: r.closed, transcripts: r.transcripts };
+  }
+
+  /** 当前该发给哪些宠物：API 每只独立；ACP 最多一只（按目录顺序取第一只已启用的）。 */
+  function targetsForSend() {
+    const cfg = readPetSeeConfig();
+    const now = Date.now();
+    const targets = [];
+    let acpTaken = false;
+    for (const pet of petCatalog) {
+      const setting = cfg.pets[pet.id];
+      if (!setting || setting.enabled !== true) continue;
+      if ((petBackoff.get(pet.id) || 0) > now) continue;
+      if (pet.provider === 'acp') {
+        if (acpTaken) continue;
+        acpTaken = true;
+      }
+      targets.push({
+        ...pet,
+        surface: pet.display === 'web' ? 'web' : 'desktop',
+        commentStyle: setting.commentStyle || '',
+      });
+    }
+    return targets;
+  }
+
+  function petBackoffFor(id, reason) {
+    const fails = (petFails.get(id) || 0) + 1;
+    petFails.set(id, fails);
+    const delay = Math.min(300000, 30000 * (2 ** Math.min(fails - 1, 5)));
+    petBackoff.set(id, Date.now() + delay);
+    log(`pet=${id} ${reason} → backoff ${delay}ms`);
+  }
+
+  function petOk(id) {
+    petFails.delete(id);
+    petBackoff.delete(id);
   }
 
   async function drain() {
@@ -764,60 +964,80 @@ export async function apply(ctx) {
     if (now < backoffUntil || now - lastSentAt < wakeGapMs) return;
     if (!pendingSheet) return;
     const sheet = pendingSheet;
+    const targets = targetsForSend();
+    if (targets.length === 0) {
+      if (Date.now() - lastNoTargetWarnAt > 600_000) {
+        lastNoTargetWarnAt = Date.now();
+        log('drain skipped: no pet enabled (or all in backoff)');
+      }
+      return;   // 保留 pendingSheet，等用户开启宠物后再发
+    }
     pendingSheet = null;
     inflight = true;
     const ac = new AbortController();
     drainAbort = ac;
     try {
-      // 发图前先看 ACP 会话是否已经太大；重置失败不阻塞本次点评。
+      const acpTarget = targets.find((t) => t.provider === 'acp');
       let didReset = false;
-      await maybeResetSession(ac.signal).then((v) => { didReset = v; }).catch((e) => {
-        if (e?.name !== 'AbortError') log(`session reset ERR: ${e.message}`);
-      });
+      if (acpTarget) {
+        // 只有存在启用的 ACP 宠物时才需要检查共享会话。
+        await maybeResetSession(ac.signal).then((v) => { didReset = v; }).catch((e) => {
+          if (e?.name !== 'AbortError') log(`session reset ERR: ${e.message}`);
+        });
+      }
       if (ac.signal.aborted || !canRun()) return;
-      let { status, body, skipped } = await postImage(petBase, sheet, ac.signal, ffmpegPath);
-      // 刚重置出来的新 CodeBuddy 会话第一轮可能只发工具调用、没有正文（pet 回“模型未返回文本”）。
-      // 这一轮之后工具结果已经进历史，重发一次通常就能正常出短评。
-      if (didReset && !skipped) {
-        let parsed;
-        try { parsed = JSON.parse(body); } catch { /* 非 JSON 不重试 */ }
-        if (parsed && parsed.ok === false && String(parsed.message || '').includes('模型未返回文本')) {
-          log('session reset: first reply empty, retry once');
-          await new Promise((resolve) => setTimeout(resolve, 1200));
-          if (ac.signal.aborted || !canRun()) return;
-          ({ status, body, skipped } = await postImage(petBase, sheet, ac.signal, ffmpegPath));
+
+      let anyOk = false;
+      for (const target of targets) {
+        if (ac.signal.aborted || !canRun()) break;
+        try {
+          let result = await postImage(petBase, sheet, ac.signal, ffmpegPath, target);
+          // 刚重置出来的新 CodeBuddy 会话第一轮可能只发工具调用、没有正文（pet 回“模型未返回文本”）。
+          // 这一轮之后工具结果已经进历史，重发一次通常就能正常出短评。
+          if (didReset && target.provider === 'acp' && !result.skipped) {
+            let parsed;
+            try { parsed = JSON.parse(result.body); } catch { /* 非 JSON 不重试 */ }
+            if (parsed && parsed.ok === false && String(parsed.message || '').includes('模型未返回文本')) {
+              log(`pet=${target.id} session reset: first reply empty, retry once`);
+              await new Promise((resolve) => setTimeout(resolve, 1200));
+              if (ac.signal.aborted || !canRun()) break;
+              result = await postImage(petBase, sheet, ac.signal, ffmpegPath, target);
+            }
+          }
+          if (result.skipped) {
+            // 所有宠物共用同一张图；放不下就整轮跳过，不进退避。
+            log(`SKIP pet=${target.id} sheet@${sheet.at}s why=${sheet.why} (attachment over ${PET_MAX_B64} b64 chars)`);
+            break;
+          }
+          // dsh-pet 的 /chat 用 okResult/failResult 包装，成功与失败都是 HTTP 200，
+          // 区别只在 body 的 ok 字段。这里必须解 body，否则限流/超时会被当成成功继续喂图。
+          let bodyOk = true;
+          try {
+            const parsed = JSON.parse(result.body);
+            if (parsed && parsed.ok === false) bodyOk = false;
+          } catch { /* 非 JSON 无法判断，按成功处理（pet 正常返回都是 JSON） */ }
+          if (result.status >= 200 && result.status < 300 && bodyOk) {
+            anyOk = true;
+            petOk(target.id);
+            log(`OK pet=${target.id} status=${result.status} sheet@${sheet.at}s why=${sheet.why} :: ${result.body.slice(0, 160)}`);
+            try { appendFileSync(WATCH_LOG, `${new Date().toISOString()} OK pet=${target.id} ${result.body}\n`, 'utf8'); } catch { /* ignore */ }
+          } else if (result.status === 429 || result.status >= 500) {
+            petBackoffFor(target.id, `THROTTLE status=${result.status}`);
+          } else if (result.status >= 200 && result.status < 300 && !bodyOk) {
+            petBackoffFor(target.id, `SOFT-FAIL body.ok=false :: ${result.body.slice(0, 160)}`);
+            try { appendFileSync(WATCH_LOG, `${new Date().toISOString()} SOFT-FAIL pet=${target.id} ${result.body}\n`, 'utf8'); } catch { /* ignore */ }
+          } else {
+            petBackoffFor(target.id, `FAIL status=${result.status} :: ${result.body.slice(0, 200)}`);
+          }
+        } catch (e) {
+          if (e?.name === 'AbortError') {
+            if (dshFocused) log('drain aborted (DSH focused)');
+            break;
+          }
+          petBackoffFor(target.id, `ERR ${e.message}`);
         }
       }
-      if (skipped) {
-        // 图放不下就没发请求：不进退避、不更新 lastSentAt，下一张照常试
-        log(`SKIP sheet@${sheet.at}s why=${sheet.why} (attachment over ${PET_MAX_B64} b64 chars)`);
-        return;
-      }
-      // dsh-pet 的 /chat 用 okResult/failResult 包装，成功与失败都是 HTTP 200，
-      // 区别只在 body 的 ok 字段。这里必须解 body，否则限流/超时会被当成成功继续喂图。
-      let bodyOk = true;
-      try {
-        const parsed = JSON.parse(body);
-        if (parsed && parsed.ok === false) bodyOk = false;
-      } catch { /* 非 JSON 无法判断，按成功处理（pet 正常返回都是 JSON） */ }
-      if (status >= 200 && status < 300 && bodyOk) {
-        lastSentAt = Date.now(); consecutiveFails = 0;
-        log(`OK status=${status} sheet@${sheet.at}s why=${sheet.why} :: ${body.slice(0, 160)}`);
-        try { appendFileSync(WATCH_LOG, `${new Date().toISOString()} OK ${body}\n`, 'utf8'); } catch { /* ignore */ }
-      } else if (status === 429 || status >= 500) {
-        backoff(`THROTTLE status=${status}`);
-      } else if (status >= 200 && status < 300 && !bodyOk) {
-        // 限流 / 余额不足 / 超时等：HTTP 200 但 body.ok=false
-        backoff(`SOFT-FAIL body.ok=false :: ${body.slice(0, 160)}`);
-        try { appendFileSync(WATCH_LOG, `${new Date().toISOString()} SOFT-FAIL ${body}\n`, 'utf8'); } catch { /* ignore */ }
-      } else {
-        consecutiveFails += 1;
-        log(`FAIL status=${status} :: ${body.slice(0, 200)}`);
-      }
-    } catch (e) {
-      // 失焦导致的主动取消不算失败，不触发退避
-      if (e?.name === 'AbortError' && dshFocused) log('drain aborted (DSH focused)');
-      else backoff(`ERR ${e.message}`);
+      if (anyOk) lastSentAt = Date.now();
     } finally { inflight = false; drainAbort = null; }
   }
 
@@ -832,6 +1052,7 @@ export async function apply(ctx) {
       if (pet) {
         lastPetCheck = Date.now();
         petBase = pet.base;
+        if (pet.config) petCatalog = petCatalogOf(pet.config);
         if (pet.up !== petAlive) {
           petAlive = pet.up;
           if (pet.up) {

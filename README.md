@@ -38,22 +38,38 @@ node scripts/install-dev.mjs
 - **图片超限自动转 JPEG**：桌宠对 `attachment` 的 base64 有 900000 字符上限；超过时用 ffmpeg 转成 JPEG 再发，仍放不下就跳过这一张（记 `SKIP` 日志），不会把请求打成失败、也不会误触发退避。
 - **速率保护**：串行发送 + 429 指数退避，不会刷屏；`generate-error`（模型侧报错 / 生成取消）照常退避。
 - **会话过大自动重置（可选）**：pet 的 `/chat` 走 ACP 时会复用 dsh-ntr 的 `dsh-pet` 长期会话，上下文会越积越大。开启后，插件在每次发图前通过 dsh-ntr 的 `/acp` 读取该会话的 `usage.used`，超过阈值就先关闭并重建会话，避免单次请求涨到几十万 token。CodeBuddy 会把关闭的会话保存在 `~/.codebuddy/projects/<project>/<sessionId>.jsonl` 并在下一次 prompt 重新加载，所以插件会直接删除这份 transcript 来真正清空上下文；新会话第一条点评可能空一次，插件会自动重试。重置会清空 pet 的 ACP 对话上下文（包括你刚和它聊的内容），人设与设置不受影响。dsh-ntr 不在或接口不可用时自动跳过。
+- **按宠物区分看图**：设置页按 dsh-pet 的宠物顺序逐只列出；默认全部关闭。API 宠物可多只同时启用；ACP 宠物同一时间只能启用一只，其他 ACP 开关置灰。每只宠物的人设自动读取 dsh-pet 的 `whisperPrompt`（实例 > 条目 > dsh-pet 内置默认），风格/篇幅可单独填写，留空用默认句。
+- **手动清空 ACP 会话**：重置阈值旁有“清空 ACP 会话”按钮，随时关闭并删除共享的 `dsh-pet` 会话。ACP 宠物切换时不会自动清空，只提示可能串味，由用户决定是否清空。
 
 ## 设置界面
 
-DSH 设置里新增 **dsh-pet-see-live** 分区，三个控件：
+DSH 设置里的 **dsh-pet-see-live** 分区包含：
 
 - **语音识别（听同期声音）**：开 / 关。
-- **DSH 聚焦时暂停识别**：开 / 关，默认开。由 DSH 窗口焦点判定；DSH 界面没打开时不会暂停。
-- **pet 会话记忆超限自动重置**：开 / 关（默认关），以及重置阈值（64k / 128k / 200k / 256k / 300k tokens）。开启后即时生效，不用重启。
+- **DSH 聚焦时暂停识别**：开 / 关，默认开。
+- **宠物看图说话**：按 dsh-pet 设置页的顺序逐只列出：
+  - 人设（只读，来自 dsh-pet 的 `whisperPrompt`）；
+  - 风格 / 篇幅（留空使用默认：“自然随意地用短短一句说说你的想法，可以吐槽、夸奖或贬损。”）；
+  - 启用看图发图（默认全部关闭；ACP 宠物同一时间只能启用一只，其他 ACP 开关置灰）。
+- **pet 会话记忆超限自动重置**：开 / 关，以及阈值（64k / 128k / 200k / 256k / 300k tokens）。
+- **清空 ACP 会话**：在阈值旁边，点击后关闭并删除共享的 `dsh-pet` 会话；只影响 ACP，不影响 API 宠物。
+- **保存**：一个按钮保存整个分区（宠物开关、风格、听音、暂停、重置阈值）。
 
 配置落在 `~/.dsh/pet-see-live.json`：
 
 ```json
-{ "listenEnabled": false, "pauseOnFocus": true, "sessionResetEnabled": false, "sessionResetThreshold": 200000 }
+{
+  "listenEnabled": false,
+  "pauseOnFocus": true,
+  "sessionResetEnabled": false,
+  "sessionResetThreshold": 200000,
+  "pets": {
+    "main": { "enabled": false, "commentStyle": "" }
+  }
+}
 ```
 
-听音 / 聚焦暂停改动需**重启 DSH** 生效（和 see-now 一致）；会话重置的两个字段即时生效。设置只决定这几个开关，其余参数见下一节。
+听音 / 聚焦暂停改动需**重启 DSH** 生效（和 see-now 一致）；宠物开关、风格和 ACP 重置设置保存后即时生效。
 
 ## 参数跟随 see-now
 
