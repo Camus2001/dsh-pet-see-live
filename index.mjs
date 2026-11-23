@@ -255,7 +255,7 @@ async function handleSettingsRequest(req, res, focus) {
 }
 
 /**
- * 把 see-now 图集的帧清单写成 pet 能读懂的时间顺序说明。
+ * 把 see-now 图集的画面清单写成 pet 能读懂的时间顺序说明。
  *
  * 图里每格虽然烧了编号，但只发 PNG 的话模型不知道编号代表什么；
  * see-now 原本会在工具文本里附带 frame@时间码，这里补上同一份信息。
@@ -272,10 +272,10 @@ function sheetPrompt(sheet) {
     .map((f, i) => `${i + 1}=+${Math.max(0, (Number(f.t) || 0) - first).toFixed(1)}s`)
     .join('、');
   return [
-    `这是一张按时间采样的连拍图集，不是一张静态截图：共 ${frames.length} 帧，`
+    `这是一张按时间采样的连拍图集，不是一张静态截图：一共 ${frames.length} 张画面，`
       + `每格左上角的编号 1→${frames.length} 就是真实时间顺序（1 最早，${frames.length} 最晚），`
       + '不要按左右/上下阅读顺序理解。',
-    `各帧相对第 1 帧的时刻：${times}；整段跨度 ${Math.max(0, last - first).toFixed(1)} 秒。`,
+    `每张画面相对第一张的时刻：${times}；整段跨度 ${Math.max(0, last - first).toFixed(1)} 秒。`,
     '按时间顺序看完，你的想法是什么？',
     lines,
   ].filter(Boolean).join('\n');
