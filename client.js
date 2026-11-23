@@ -29,6 +29,7 @@ window.__ModuleLoader__.load({
       pauseOnFocusHint: '开启后，当 DSH 主窗口处于系统前台时自动暂停抓屏与听音，焦点离开后恢复（桌宠窗口不算）。由窗口焦点事件判定，DSH 界面没打开时不会暂停。',
       petsTitle: '宠物看图说话',
       petsHint: '顺序与 dsh-pet 设置页一致。',
+      lengthHint: '提示：人设 + 风格/篇幅 + 时间线合计不要超过 2000 字，否则 dsh-pet 会拒绝这条看图消息。',
       petOffline: '未读取到宠物，请确认 dsh-pet 在线。',
       refresh: '刷新',
       persona: '人设（来自 dsh-pet）',
@@ -38,6 +39,7 @@ window.__ModuleLoader__.load({
       enabled: '启用看图发图',
       acpLocked: '另一只 ACP 宠物已启用，先关闭它。',
       acpNote: 'ACP 宠物同一时间只能启用一只。',
+      displayNone: '宠物当前 display=none，不会显示，也不会发图。',
       sessionReset: 'pet 会话记忆超限自动重置',
       sessionResetHint: '仅适用于dsh-ntr的acp会话。开启后，pet 的acp会话上下文超过阈值将会清空，人设与设置不受影响。使用api时本设置不起作用。',
       sessionResetThreshold: '重置阈值',
@@ -225,6 +227,7 @@ window.__ModuleLoader__.load({
           h('div', { style: { fontWeight: 600, marginBottom: 4 } }, t('petsTitle')),
           h('div', { style: { opacity: 0.65, fontSize: 12, lineHeight: 1.5, marginBottom: 10 } }, t('petsHint')),
           hasAcp ? h('div', { style: { opacity: 0.65, fontSize: 12, marginBottom: 10 } }, t('acpNote')) : null,
+          h('div', { style: { opacity: 0.65, fontSize: 12, marginBottom: 10 } }, t('lengthHint')),
           values.pets.length === 0
             ? h('div', null,
               h('p', { style: { opacity: 0.7, fontSize: 13 } }, t('petOffline')),
@@ -233,7 +236,9 @@ window.__ModuleLoader__.load({
             : values.pets.map((pet, index) => {
               const draft = drafts[pet.id] || { enabled: false, commentStyle: '' };
               const acp = pet.provider === 'acp';
-              const locked = acp && activeAcpId !== '' && activeAcpId !== pet.id;
+              const hidden = pet.display === 'none';
+              const acpLocked = acp && activeAcpId !== '' && activeAcpId !== pet.id;
+              const locked = acpLocked;
               return h('div', {
                 key: pet.id,
                 style: {
@@ -288,7 +293,8 @@ window.__ModuleLoader__.load({
                   }),
                   h('span', null, t('enabled')),
                 ),
-                locked ? h('div', { style: { fontSize: 11, opacity: 0.6, marginTop: 4 } }, t('acpLocked')) : null,
+                hidden ? h('div', { style: { fontSize: 11, opacity: 0.6, marginTop: 4 } }, t('displayNone'))
+                  : acpLocked ? h('div', { style: { fontSize: 11, opacity: 0.6, marginTop: 4 } }, t('acpLocked')) : null,
               );
             }),
         ),

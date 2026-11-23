@@ -83,7 +83,7 @@ function personaOf(entry, pet) {
 function petCatalogOf(config) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) return [];
   const out = [];
-  for (const [entryKey, entry] of Object.entries(config)) {
+  for (const entry of Object.values(config)) {
     if (!entry || typeof entry !== 'object') continue;
     const provider = typeof entry.chatModel?.provider === 'string' ? entry.chatModel.provider : '';
     const pets = Array.isArray(entry.pets) ? entry.pets : [];
@@ -96,7 +96,6 @@ function petCatalogOf(config) {
         display: typeof pet.display === 'string' ? pet.display : 'desktop',
         provider,
         persona: personaOf(entry, pet),
-        entryKey,
       });
     }
   }
@@ -171,14 +170,27 @@ function log(line) {
 // 这样渲染端崩溃 / 页面重载时最多退化成"不暂停"，不会把采集永久卡住。
 const FOCUS_FRESH_MS = 30_000;
 
-// see-now 的节奏/档位定义（捕获异常：缺失时优雅禁用）
+// see-now 的节奏/档位定义（捕获异常：缺失时优雅禁用）。
+// 启动时最多重试 5 次，覆盖“DSH 启动瞬间依赖还没装好”的竞态；仍缺失则本次进程跳过。
 let spawnFrames, createPipeline, PACES, SIZES, DEFAULT_PACE, DEFAULT_QUALITY;
-try {
-  ({ spawnFrames } = await import('dsh-see-now/capture'));
-  ({ createPipeline } = await import('dsh-see-now/pipeline'));
-  ({ PACES, SIZES, DEFAULT_PACE, DEFAULT_QUALITY } = await import('dsh-see-now/runner'));
-} catch (e) {
-  log(`disabled: dsh-see-now not available (${e.message}). Install it first.`);
+let lastSeeNowError = null;
+async function loadSeeNowCore() {
+  try {
+    ({ spawnFrames } = await import('dsh-see-now/capture'));
+    ({ createPipeline } = await import('dsh-see-now/pipeline'));
+    ({ PACES, SIZES, DEFAULT_PACE, DEFAULT_QUALITY } = await import('dsh-see-now/runner'));
+    return true;
+  } catch (e) {
+    lastSeeNowError = e;
+    return false;
+  }
+}
+for (let i = 0; i < 5; i += 1) {
+  if (await loadSeeNowCore()) break;
+  if (i < 4) await new Promise((resolve) => setTimeout(resolve, 1000));
+}
+if (!spawnFrames || !createPipeline || !PACES) {
+  log(`disabled: dsh-see-now not available (${lastSeeNowError?.message || 'unknown'}). Install it first.`);
 }
 
 // see-now 的设置读取器：与它自己的设置页共用同一份校验逻辑。
@@ -192,8 +204,9 @@ async function importSeeNowFile(rel) {
 
 let readSeeNowTuning = null;
 let LISTEN_DEFAULTS = null;
+let TUNING_DEFAULTS = null;
 try {
-  ({ readTuning: readSeeNowTuning, LISTEN_DEFAULTS } = await importSeeNowFile('src/tuning.js'));
+  ({ readTuning: readSeeNowTuning, LISTEN_DEFAULTS, TUNING_DEFAULTS } = await importSeeNowFile('src/tuning.js'));
 } catch (e) {
   log(`tuning reader unavailable (${e.message}); only defaultPace/fps will follow see-now`);
 }
@@ -262,8 +275,8 @@ function seeNowSettings() {
   try { raw = JSON.parse(readFileSync(SEE_NOW_CFG, 'utf8')); } catch { /* 用默认 */ }
   const paceName = tuning?.defaultPace ?? raw.defaultPace;
   const pace = PACES[paceName] ? paceName : DEFAULT_PACE;
-  const fpsRaw = Number(tuning?.fps ?? raw.fps);
-  const fps = Number.isFinite(fpsRaw) && fpsRaw > 0 ? fpsRaw : 12;
+  const rawFps = Number(raw.fps);
+  const fps = Number.isFinite(rawFps) && rawFps > 0 ? rawFps : (TUNING_DEFAULTS?.fps ?? 12);
   return { pace, fps, p: PACES[pace], tuning };
 }
 
@@ -606,8 +619,6 @@ export async function apply(ctx) {
   let pendingSheet = null;
   let lastSentAt = 0;
   let inflight = false;
-  let backoffUntil = 0;
-  let consecutiveFails = 0;
   let drainAbort = null;
   // 宠物目录：顺序与 dsh-pet 设置页一致；由 /config 刷新。
   const petBackoff = new Map();
@@ -684,7 +695,7 @@ export async function apply(ctx) {
       log('DSH focused → pause');
       try { drainAbort?.abort(); } catch { /* ignore */ }
       stopCapture();
-      stopListen();
+      stopListen('DSH focused');
     } else {
       if (canRun()) {
         log('DSH unfocused → resume');
@@ -698,8 +709,9 @@ export async function apply(ctx) {
   async function startListen() {
     if (listenOn || disposed || dshFocused || !listenEnabled || !createListener) return;
     listenOn = true;
+    let l = null;
     try {
-      const l = createListener({
+      l = createListener({
         ctx,                       // listener 内部用 ctx.get('speechToText') → see-now 的宿主识别
         dir: AUDIO_DIR,
         listen: listenCfg,         // see-now 的 listen 设置（prefer / live / silence…）
@@ -716,30 +728,23 @@ export async function apply(ctx) {
       }
       log(`listen start ${JSON.stringify(r)}`);
       if (r && r.ok) { listener = l; lastWallTo = 0; }
-      else { listenOn = false; }
+      else { try { l.stop('start failed'); } catch { /* ignore */ } listenOn = false; }
     } catch (e) {
+      try { l?.stop('start failed'); } catch { /* ignore */ }
       log(`listen FATAL: ${e.stack || e.message}`);
       listenOn = false;
     }
   }
 
   /** 停听音：清掉台词游标，避免下次重启重复喂同一批台词。 */
-  function stopListen() {
+  function stopListen(reason = 'pet offline') {
     if (!listenOn && !listener) return;
     listenOn = false;
     const l = listener;
     listener = null;
     lastWallTo = 0;
-    try { l?.stop('pet offline'); } catch { /* ignore */ }
-    log('listen stopped');
-  }
-
-  /** 统一退避：dsh-pet 把生成失败/限流都包成 HTTP 200 + body.ok=false，必须看 body 才不会误判成功。 */
-  function backoff(reason) {
-    const delay = Math.min(300000, 30000 * (2 ** Math.min(consecutiveFails, 5)));
-    backoffUntil = Date.now() + delay;
-    consecutiveFails += 1;
-    log(`${reason} → backoff ${delay}ms`);
+    try { l?.stop(reason); } catch { /* ignore */ }
+    log(`listen stopped (${reason})`);
   }
 
   // ---- ACP 会话重置 -------------------------------------------------------
@@ -931,6 +936,7 @@ export async function apply(ctx) {
     for (const pet of petCatalog) {
       const setting = cfg.pets[pet.id];
       if (!setting || setting.enabled !== true) continue;
+      if (pet.display === 'none') continue;   // dsh-pet 对 none 的宠物拒绝 desktop/web 的 /chat
       if ((petBackoff.get(pet.id) || 0) > now) continue;
       if (pet.provider === 'acp') {
         if (acpTaken) continue;
@@ -961,7 +967,7 @@ export async function apply(ctx) {
   async function drain() {
     if (inflight || disposed || !canRun() || !petBase) return;
     const now = Date.now();
-    if (now < backoffUntil || now - lastSentAt < wakeGapMs) return;
+    if (now - lastSentAt < wakeGapMs) return;
     if (!pendingSheet) return;
     const sheet = pendingSheet;
     const targets = targetsForSend();
@@ -1058,7 +1064,7 @@ export async function apply(ctx) {
           if (pet.up) {
             if (canRun()) { log('pet ONLINE → start'); startCapture(); void startListen(); }
             else log('pet ONLINE → held (DSH focused)');
-          } else { log('pet OFFLINE → stop'); stopCapture(); stopListen(); }
+          } else { log('pet OFFLINE → stop'); stopCapture(); stopListen('pet offline'); }
         }
       }
       // 失焦期间 DSH 聚焦已暂停抓屏，这里直接返回，不再取帧/喂图
@@ -1099,7 +1105,7 @@ export async function apply(ctx) {
     clearInterval(ticker);
     clearTimeout(restartTimer);
     try { drainAbort?.abort(); } catch { /* ignore */ }
-    stopListen();
+    stopListen('dispose');
     stopCapture();
   };
 }
