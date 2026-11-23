@@ -22,7 +22,7 @@ python -m pip install numpy pyaudiowpatch
 node scripts/install-dev.mjs
 ```
 
-脚本会把插件复制进 desktop profile 并登记 bundle，装完**重启 DSH** 生效。没有配置文件要填。
+脚本会把插件复制进 desktop profile 并登记 bundle，装完**重启 DSH** 生效。源码安装不写 profile 的 `dependencies` / `pnpm-lock.yaml`，旧版本留下的 `file:` 依赖和 lock 条目会自动清理。
 
 > 为什么不用 `dsh plugin add`：desktop profile 由 DSH 桌面端独占管理，`dsh plugin --profile desktop ...` 会被拒绝，所以这里用随附的 `install-dev.mjs` 安装（和 see-now 的源码安装方式一致）。
 > 想先看看会改什么：`node scripts/install-dev.mjs --check`。可用 `DSH_PROFILE` 指定其它 profile。
@@ -93,13 +93,23 @@ DSH 设置里的 **dsh-pet-see-live** 分区包含：
 
 ## 卸载
 
-在仓库目录运行：
+在源码目录运行：
 
 ```bash
 node scripts/install-dev.mjs --remove
+# 连同设置 / 日志 / 音频一起清掉：
+node scripts/install-dev.mjs --remove --purge
 ```
 
 然后重启 DSH。
+
+默认卸载会保留 `~/.dsh/pet-see-live.json`、`see-live-plugin.log` 和 `see-live-audio/`；加 `--purge` 才会清理。
+
+如果源码目录已经删除，可以手动卸载：
+
+1. 从 `~/.dsh/profiles/desktop/package.json` 的 `dsh.profile.bundles` 里删掉 `dsh-pet-see-live`（以及可能残留的 `dependencies.dsh-pet-see-live`）；
+2. 删除 `~/.dsh/profiles/desktop/node_modules/dsh-pet-see-live`；
+3. 重启 DSH。
 
 ## 许可
 
