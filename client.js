@@ -25,7 +25,10 @@ window.__ModuleLoader__.load({
       listenHint: '开启后复用 see-now 的音频采集，识别也沿用 see-now 设置页的转写后端（宿主 SenseVoice 或 ~/.dsh/asr.json），pet 会把听到的话和画面一起点评。Windows 需 numpy + pyaudiowpatch。',
       pauseOnFocus: 'DSH 聚焦时暂停识别',
       pauseOnFocusHint: '开启后，当 DSH 主窗口处于系统前台时自动暂停抓屏与听音，焦点离开后恢复（桌宠窗口不算）。由窗口焦点事件判定，DSH 界面没打开时不会暂停。',
-      restart: '改动需重启 DSH 后生效。',
+      sessionReset: 'pet 会话记忆超限自动重置',
+      sessionResetHint: '开启后，每次发图前会检查 pet 的 ACP 会话上下文（dsh-ntr 的 dsh-pet 会话）；超过阈值就先关闭并重建会话，避免单次请求涨到几十万 token。重置会清空 pet 的 ACP 对话上下文（包括你刚和它聊的内容），人设与设置不受影响。CodeBuddy 的旧 transcript 会直接删除；新会话第一条点评可能空一次，插件会自动重试。需要 dsh-ntr 提供 /acp 接口；不可用时自动跳过。',
+      sessionResetThreshold: '重置阈值',
+      restart: '听音 / 暂停改动需重启 DSH；会话重置设置即时生效。',
       saving: '保存中…',
       saved: '已保存',
       failed: '保存失败',
@@ -49,11 +52,17 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         let alive = true;
+        const pick = j => ({
+          listenEnabled: j.listenEnabled === true,
+          pauseOnFocus: j.pauseOnFocus !== false,
+          sessionResetEnabled: j.sessionResetEnabled === true,
+          sessionResetThreshold: Number(j.sessionResetThreshold) || 200000,
+        });
         fetch(`${API}/status`)
           .then(r => r.json())
           .then(j => {
             if (!alive) return;
-            if (j && j.ok) setValues({ listenEnabled: j.listenEnabled, pauseOnFocus: j.pauseOnFocus });
+            if (j && j.ok) setValues(pick(j));
             else setErr(t('loadFailed'));
           })
           .catch(() => { if (alive) setErr(t('loadFailed')); });
@@ -71,7 +80,12 @@ window.__ModuleLoader__.load({
           .then(r => r.json())
           .then(j => {
             if (j && j.ok) {
-              setValues({ listenEnabled: j.listenEnabled, pauseOnFocus: j.pauseOnFocus });
+              setValues({
+                listenEnabled: j.listenEnabled === true,
+                pauseOnFocus: j.pauseOnFocus !== false,
+                sessionResetEnabled: j.sessionResetEnabled === true,
+                sessionResetThreshold: Number(j.sessionResetThreshold) || 200000,
+              });
               setState(t('saved'));
             } else {
               setState(t('failed'));
@@ -109,6 +123,30 @@ window.__ModuleLoader__.load({
                 onChange: e => save({ pauseOnFocus: e.target.checked }),
               }),
               h('span', null, values.pauseOnFocus !== false ? '开启' : '关闭'),
+            )),
+            h(Row, {
+              title: t('sessionReset'),
+              hint: t('sessionResetHint'),
+            }, h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+              h('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 8 } },
+                h('input', {
+                  type: 'checkbox',
+                  checked: values.sessionResetEnabled === true,
+                  onChange: e => save({ sessionResetEnabled: e.target.checked }),
+                }),
+                h('span', null, values.sessionResetEnabled === true ? '开启' : '关闭'),
+              ),
+              h('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 8 } },
+                h('span', { style: { opacity: 0.75, fontSize: 13 } }, t('sessionResetThreshold')),
+                h('select', {
+                  value: String(values.sessionResetThreshold || 200000),
+                  disabled: values.sessionResetEnabled !== true,
+                  onChange: e => save({ sessionResetThreshold: Number(e.target.value) }),
+                  style: { padding: '4px 8px' },
+                }, [['64k', 65536], ['128k', 131072], ['200k', 200000], ['256k', 262144], ['300k', 300000]].map(([label, n]) =>
+                  h('option', { key: n, value: String(n) }, `${label} tokens`)
+                )),
+              ),
             )),
           ),
         h('p', { style: { opacity: 0.65, fontSize: 12, marginTop: 16 } },

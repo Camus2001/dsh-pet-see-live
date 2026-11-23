@@ -15,7 +15,8 @@
  * 跨平台：Windows / macOS / Linux（听音在 Windows 上依赖 pyaudiowpatch + numpy）。
  */
 import { spawn } from 'node:child_process';
-import { readFileSync, appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { readFileSync, appendFileSync, existsSync, writeFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -34,6 +35,41 @@ const PET_SEE_CFG = join(dshHome(), 'pet-see-live.json');
 // dir 只是 WAV 暂存位置，不影响识别配置（识别仍走 see-now 的 resolveTranscriber / asr.json）。
 const AUDIO_DIR = join(PET_DIR, 'see-live-audio');
 const API_PREFIX = '/api/pet-see-live';
+
+// 会话重置：每次发图前读一次 dsh-ntr 的 ACP 会话用量，超过阈值就关闭并重建。
+// 阈值是 ACP 上下文 token（session/chat-list 的 usage.used），不是 pet 的 memory.json 条数。
+const DEFAULT_SESSION_RESET_THRESHOLD = 200_000;
+const SESSION_RESET_MIN_GAP_MS = 60_000;        // 两次重置之间至少隔一分钟，防抖
+const SESSION_RESET_FAIL_COOLDOWN_MS = 300_000; // RPC 失败后 5 分钟内不再试，避免刷日志
+const ACP_AUTH_TTL_MS = 10 * 60_000;            // /connect 拿到的 cookie 复用 10 分钟
+// CodeBuddy 把每个会话的 transcript 落在 ~/.codebuddy/projects/<project>/<sessionId>.jsonl。
+// 只关闭 ACP 会话时 CodeBuddy 会在下一次 prompt 里重新加载这份 transcript，上下文并不会清空；
+// 要真正重置，必须在 close 之后把这份文件删掉。
+const CODEBUDDY_HOME_DIR = process.env.CODEBUDDY_HOME || join(homedir(), '.codebuddy');
+const CODEBUDDY_PROJECTS = join(CODEBUDDY_HOME_DIR, 'projects');
+
+/** 删除 CodeBuddy 某个会话的 transcript；返回是否真的删掉了文件。 */
+function deleteCodeBuddyTranscript(acpSessionId) {
+  if (typeof acpSessionId !== 'string' || !/^[A-Za-z0-9._-]+$/.test(acpSessionId)) return false;
+  let dirs = [];
+  try {
+    dirs = readdirSync(CODEBUDDY_PROJECTS, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch { return false; }
+  for (const dir of dirs) {
+    const file = join(CODEBUDDY_PROJECTS, dir, `${acpSessionId}.jsonl`);
+    if (!existsSync(file)) continue;
+    try {
+      unlinkSync(file);
+      return true;
+    } catch (e) {
+      log(`session reset: transcript delete failed (${e.message})`);
+      return false;
+    }
+  }
+  return false;
+}
 
 function log(line) {
   const s = `${new Date().toISOString()} ${line}\n`;
@@ -83,13 +119,18 @@ try {
   log(`listener unavailable (${e.message}); audio listening disabled`);
 }
 
-/** 读本插件自己的设置：语音识别开关与 DSH 聚焦暂停。 */
+/** 读本插件自己的设置：语音识别、聚焦暂停、ACP 会话重置。 */
 function readPetSeeConfig() {
   let raw = {};
   try { raw = JSON.parse(readFileSync(PET_SEE_CFG, 'utf8')); } catch { /* 用默认 */ }
+  const threshold = Number(raw.sessionResetThreshold);
   return {
     listenEnabled: raw.listenEnabled === true,
     pauseOnFocus: raw.pauseOnFocus !== false,   // 默认开启
+    sessionResetEnabled: raw.sessionResetEnabled === true,
+    sessionResetThreshold: Number.isFinite(threshold)
+      ? Math.min(2_000_000, Math.max(4096, Math.round(threshold)))
+      : DEFAULT_SESSION_RESET_THRESHOLD,
   };
 }
 
@@ -171,8 +212,8 @@ async function checkPet(ctx, webServer) {
   } catch { return { up: false, base }; }
 }
 
-/** 挂设置页用的同源 HTTP API：GET /status、POST /config。 */
-function installSettingsApi(ctx, focus, onWebServer) {
+/** 挂设置页用的同源 HTTP API：GET /status、POST /config；并把 connection 交给会话重置用。 */
+function installSettingsApi(ctx, focus, onWebServer, onConnection) {
   if (!ctx?.inject) return;
   try {
     ctx.inject(['webServer'], (scoped) => {
@@ -184,6 +225,12 @@ function installSettingsApi(ctx, focus, onWebServer) {
     });
   } catch (e) {
     log(`settings API unavailable: ${e.message}`);
+  }
+  try {
+    // 只用于读/关 dsh-ntr 的 ACP 会话；拿不到时重置功能静默跳过，不影响抓屏与设置页。
+    ctx.inject(['connection'], (scoped) => { onConnection(scoped.connection); });
+  } catch (e) {
+    log(`connection unavailable: ${e.message}`);
   }
 }
 
@@ -220,6 +267,15 @@ async function handleSettingsRequest(req, res, focus) {
       }
       if (Object.hasOwn(body, 'pauseOnFocus')) {
         if (typeof body.pauseOnFocus === 'boolean') patch.pauseOnFocus = body.pauseOnFocus;
+        else bad = true;
+      }
+      if (Object.hasOwn(body, 'sessionResetEnabled')) {
+        if (typeof body.sessionResetEnabled === 'boolean') patch.sessionResetEnabled = body.sessionResetEnabled;
+        else bad = true;
+      }
+      if (Object.hasOwn(body, 'sessionResetThreshold')) {
+        const n = Number(body.sessionResetThreshold);
+        if (Number.isFinite(n) && n >= 4096 && n <= 2_000_000) patch.sessionResetThreshold = Math.round(n);
         else bad = true;
       }
       if (bad || Object.keys(patch).length === 0) {
@@ -259,12 +315,16 @@ async function handleSettingsRequest(req, res, focus) {
  *
  * 图里每格虽然烧了编号，但只发 PNG 的话模型不知道编号代表什么；
  * see-now 原本会在工具文本里附带 frame@时间码，这里补上同一份信息。
+ * 开头固定一段人设/风格约束：ACP 会话被重置后是新会话，没有旧对话里的语气示范，
+ * 不写这段它会按 CodeBuddy 的分析口吻分点输出。
  */
+const PET_STYLE_PROMPT = '你是主人桌上的 Q 版蓝发小女仆（DeepSeek 大肥鱼），温柔乖巧、带点俏皮。只回一句不超过20字的点评，不要分点、不要 Markdown、不要分析过程。';
+
 function sheetPrompt(sheet) {
   const frames = Array.isArray(sheet?.frames) ? sheet.frames : [];
   const lines = linesBlock(sheet?.lines);
   if (frames.length < 2) {
-    return '看一眼我现在的屏幕，用简短一句话吐槽或评价，不超过20字。' + lines;
+    return `${PET_STYLE_PROMPT}\n看一眼我现在的屏幕，用简短一句话吐槽或评价，不超过20字。` + lines;
   }
   const first = Number(frames[0].t) || 0;
   const last = Number(frames[frames.length - 1].t) || first;
@@ -272,6 +332,7 @@ function sheetPrompt(sheet) {
     .map((f, i) => `${i + 1}=+${Math.max(0, (Number(f.t) || 0) - first).toFixed(1)}s`)
     .join('、');
   return [
+    PET_STYLE_PROMPT,
     `这是一张按时间采样的连拍图集，不是一张静态截图：一共 ${frames.length} 张画面，`
       + `每格左上角的编号 1→${frames.length} 就是真实时间顺序（1 最早，${frames.length} 最晚），`
       + '不要按左右/上下阅读顺序理解。',
@@ -379,7 +440,7 @@ export async function apply(ctx) {
     return () => {};
   }
   const { pace, fps, p, tuning } = seeNowSettings();
-  const { listenEnabled, pauseOnFocus } = readPetSeeConfig();
+  const { listenEnabled, pauseOnFocus, sessionResetEnabled, sessionResetThreshold } = readPetSeeConfig();
   const quality = DEFAULT_QUALITY;
   const [width, height] = SIZES[quality];
   const wakeGapMs = p.wakeGapSec * 1000;   // see-now 自己的"多久叫醒一次"
@@ -387,13 +448,15 @@ export async function apply(ctx) {
   log(
     `apply: pace=${pace} fps=${fps} ${width}x${height} quality=${quality}`
       + ` listen=${listenEnabled && createListener ? 'on' : 'off'} pauseOnFocus=${pauseOnFocus}`
+      + ` reset=${sessionResetEnabled ? `${sessionResetThreshold}` : 'off'}`
       + ` wakeGap=${wakeGapMs}ms`
       + ` tier=${tuning ? `${tuning.tierStyle}/${tuning.tierMode}/${tuning.tierCurve}` : 'defaults'}`
       + ` ffmpeg=${ffmpegPath}`,
   );
   const focus = { report: null, seen: false };
   let webServer = null;
-  installSettingsApi(ctx, focus, (ws) => { webServer = ws; });
+  let connection = null;
+  installSettingsApi(ctx, focus, (ws) => { webServer = ws; }, (c) => { connection = c; });
 
   let disposed = false;
   let petAlive = false;
@@ -537,6 +600,167 @@ export async function apply(ctx) {
     log(`${reason} → backoff ${delay}ms`);
   }
 
+  // ---- ACP 会话重置 -------------------------------------------------------
+  // 插件的 /chat 请求使用的是 dsh-pet 固定的 ACP 会话 'dsh-pet'。这里通过 dsh-ntr 的
+  // /acp RPC 读它的上下文用量（usage.used），超过阈值时关闭这个 ACP 会话；下一次 pet
+  // 请求会重新建一个空会话，从而把 26 万 token 的基线清掉。
+  // 只用公开 RPC，不碰 dsh-ntr 的文件；dsh-ntr 不在或接口不可用时静默跳过。
+  let acpAuth = null;          // { cookie, at }
+  let lastResetAt = 0;
+  let resetRetryAt = 0;
+  let lastUsageWarnAt = 0;
+  let lastUnavailableWarnAt = 0;
+
+  function acpBase() {
+    const port = typeof webServer?.port === 'number' ? webServer.port : 0;
+    if (!port) return null;
+    const scheme = webServer?.protocol === 'https:' ? 'https:' : 'http:';
+    return `${scheme}//127.0.0.1:${port}`;
+  }
+
+  /** 用 DSH 的 launch token 走一次 /connect，拿到能调 /acp 的 API cookie。 */
+  async function acpCookie(force = false) {
+    if (!connection || typeof connection.authenticatedUrl !== 'function') {
+      throw new Error('connection.authenticatedUrl unavailable');
+    }
+    if (!force && acpAuth && Date.now() - acpAuth.at < ACP_AUTH_TTL_MS) return acpAuth.cookie;
+    const base = acpBase();
+    if (!base) throw new Error('webServer port unavailable');
+    const url = connection.authenticatedUrl(`${base}/connect`);
+    const r = await fetch(url, { redirect: 'manual' });
+    const lines = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [];
+    const raw = lines.length > 0 ? lines.join('\n') : (r.headers.get('set-cookie') || '');
+    const hit = raw.match(/dsh-auth-[^=;\s]+=[^;]+/);
+    if (!hit) throw new Error(`connect ${r.status}: no auth cookie`);
+    acpAuth = { cookie: hit[0], at: Date.now() };
+    return acpAuth.cookie;
+  }
+
+  /** 调 dsh-ntr 的 /acp/<method>，返回 result.value；失败抛出带原因的 Error。 */
+  async function acpRpc(method, payload, signal) {
+    const base = acpBase();
+    if (!base) throw new Error('webServer port unavailable');
+    const call = async (cookie) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => { try { ctrl.abort(); } catch { /* ignore */ } }, 5000);
+      const onAbort = () => { try { ctrl.abort(); } catch { /* ignore */ } };
+      if (signal) {
+        if (signal.aborted) ctrl.abort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
+      try {
+        return await fetch(`${base}/acp/${method}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', cookie },
+          body: JSON.stringify({ type: 'client-request', rpcId: randomUUID(), method, payload }),
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+      }
+    };
+    let r = await call(await acpCookie(false));
+    if (r.status === 401) r = await call(await acpCookie(true));
+    if (!r.ok) throw new Error(`acp ${method} HTTP ${r.status}`);
+    const body = await r.json();
+    if (body?.type !== 'server-response') throw new Error(`acp ${method}: bad envelope`);
+    const result = body.result;
+    if (!result || result.ok !== true) {
+      const code = result?.error?.code || 'failed';
+      const msg = result?.error?.message || '';
+      throw new Error(`acp ${method}: ${code}${msg ? ` ${msg}` : ''}`);
+    }
+    return result.value;
+  }
+
+  /** 取 chat 的会话元信息（不取 transcript 条目，afterSeq 给一个极大值）。 */
+  async function acpSessionsMeta(signal) {
+    const res = await acpRpc('session/chat-transcript', { dshSessionId: 'dsh-pet', afterSeq: 1e9 }, signal);
+    return (Array.isArray(res?.views) ? res.views : [])
+      .map((v) => v?.session)
+      .filter(Boolean);
+  }
+
+  /**
+   * 发图前检查一次：ACP 会话上下文超过阈值就关闭它。
+   * 只在当前没有 turn 在跑时动手；失败只记日志，不阻塞本次发图。
+   * @returns {Promise<boolean>} 是否真的重置了
+   */
+  async function maybeResetSession(signal) {
+    const cfg = readPetSeeConfig();
+    if (!cfg.sessionResetEnabled) return false;
+    if (!connection) {
+      if (Date.now() - lastUnavailableWarnAt > 600_000) {
+        lastUnavailableWarnAt = Date.now();
+        log('session reset: connection service unavailable, skipped');
+      }
+      return false;
+    }
+    if (!webServer?.port) return false;
+    const now = Date.now();
+    if (now < resetRetryAt || now - lastResetAt < SESSION_RESET_MIN_GAP_MS) return false;
+
+    let list;
+    try {
+      list = await acpRpc('session/chat-list', { dshSessionId: 'dsh-pet' }, signal);
+    } catch (e) {
+      if (e?.name === 'AbortError') return false;
+      resetRetryAt = Date.now() + SESSION_RESET_FAIL_COOLDOWN_MS;
+      log(`session reset: chat-list failed (${e.message})`);
+      return false;
+    }
+    const rows = (Array.isArray(list?.sessions) ? list.sessions : [])
+      .filter((s) => s && typeof s.sessionId === 'string');
+    if (rows.length === 0) return false;   // 还没有 ACP 会话，下一次请求自然会新建
+    const used = rows.reduce((max, s) => Math.max(max, Number(s.usage?.used) || 0), 0);
+    if (used <= 0) {
+      if (Date.now() - lastUsageWarnAt > 600_000) {
+        lastUsageWarnAt = Date.now();
+        log('session reset: ACP usage unavailable, skipped');
+      }
+      return false;
+    }
+    if (used < cfg.sessionResetThreshold) return false;
+    if (rows.some((s) => s.running === true)) {
+      resetRetryAt = Date.now() + 30_000;   // 等这一轮结束再试
+      log(`session reset: skipped (turn running) used=${used} threshold=${cfg.sessionResetThreshold}`);
+      return false;
+    }
+
+    // 先拿 ACP sessionId：close 之后 session/chat-transcript 就查不到了。
+    let meta = [];
+    try {
+      meta = await acpSessionsMeta(signal);
+    } catch { /* 拿不到只影响 transcript 轮换，close 仍然做 */ }
+
+    const targets = rows.filter((s) => (Number(s.usage?.used) || 0) >= cfg.sessionResetThreshold);
+    const transcripts = new Set();
+    try {
+      for (const s of targets) {
+        const m = meta.find((v) => v.sessionId === s.sessionId);
+        await acpRpc('session/close', { sessionId: s.sessionId }, signal);
+        // CodeBuddy 会把关闭的会话保留在 transcript 里，下一次 prompt 又加载回来。
+        // 只对 CodeBuddy 删文件；文件不存在时说明本来就没有可恢复的上下文。
+        if (m?.agentId === 'codebuddy' && typeof m.acpSessionId === 'string') transcripts.add(m.acpSessionId);
+      }
+    } catch (e) {
+      if (e?.name === 'AbortError') return false;
+      resetRetryAt = Date.now() + SESSION_RESET_FAIL_COOLDOWN_MS;
+      log(`session reset: close failed (${e.message})`);
+      return false;
+    }
+    lastResetAt = Date.now();
+    log(`session reset: used=${used} threshold=${cfg.sessionResetThreshold} closed=${targets.length}`);
+    // 给 agent 一点收尾时间，再删 transcript，避免它把旧内容又写回同一路径。
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const id of transcripts) {
+      if (deleteCodeBuddyTranscript(id)) log(`session reset: transcript deleted (${id}.jsonl)`);
+      else log('session reset: transcript not found or delete failed; CodeBuddy may resume the old context');
+    }
+    return true;
+  }
+
   async function drain() {
     if (inflight || disposed || !canRun() || !petBase) return;
     const now = Date.now();
@@ -548,7 +772,25 @@ export async function apply(ctx) {
     const ac = new AbortController();
     drainAbort = ac;
     try {
-      const { status, body, skipped } = await postImage(petBase, sheet, ac.signal, ffmpegPath);
+      // 发图前先看 ACP 会话是否已经太大；重置失败不阻塞本次点评。
+      let didReset = false;
+      await maybeResetSession(ac.signal).then((v) => { didReset = v; }).catch((e) => {
+        if (e?.name !== 'AbortError') log(`session reset ERR: ${e.message}`);
+      });
+      if (ac.signal.aborted || !canRun()) return;
+      let { status, body, skipped } = await postImage(petBase, sheet, ac.signal, ffmpegPath);
+      // 刚重置出来的新 CodeBuddy 会话第一轮可能只发工具调用、没有正文（pet 回“模型未返回文本”）。
+      // 这一轮之后工具结果已经进历史，重发一次通常就能正常出短评。
+      if (didReset && !skipped) {
+        let parsed;
+        try { parsed = JSON.parse(body); } catch { /* 非 JSON 不重试 */ }
+        if (parsed && parsed.ok === false && String(parsed.message || '').includes('模型未返回文本')) {
+          log('session reset: first reply empty, retry once');
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          if (ac.signal.aborted || !canRun()) return;
+          ({ status, body, skipped } = await postImage(petBase, sheet, ac.signal, ffmpegPath));
+        }
+      }
       if (skipped) {
         // 图放不下就没发请求：不进退避、不更新 lastSentAt，下一张照常试
         log(`SKIP sheet@${sheet.at}s why=${sheet.why} (attachment over ${PET_MAX_B64} b64 chars)`);
