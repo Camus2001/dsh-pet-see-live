@@ -26,7 +26,7 @@ window.__ModuleLoader__.load({
       pauseOnFocus: 'DSH 聚焦时暂停识别',
       pauseOnFocusHint: '开启后，当 DSH 主窗口处于系统前台时自动暂停抓屏与听音，焦点离开后恢复（桌宠窗口不算）。由窗口焦点事件判定，DSH 界面没打开时不会暂停。',
       sessionReset: 'pet 会话记忆超限自动重置',
-      sessionResetHint: '开启后，每次发图前会检查 pet 的 ACP 会话上下文（dsh-ntr 的 dsh-pet 会话）；超过阈值就先关闭并重建会话，避免单次请求涨到几十万 token。重置会清空 pet 的 ACP 对话上下文（包括你刚和它聊的内容），人设与设置不受影响。CodeBuddy 的旧 transcript 会直接删除；新会话第一条点评可能空一次，插件会自动重试。需要 dsh-ntr 提供 /acp 接口；不可用时自动跳过。',
+      sessionResetHint: '仅适用于dsh-ntr的acp会话。开启后，pet 的acp会话上下文超过阈值将会清空，人设与设置不受影响。使用api时本设置不起作用。',
       sessionResetThreshold: '重置阈值',
       restart: '听音 / 暂停改动需重启 DSH；会话重置设置即时生效。',
       saving: '保存中…',
