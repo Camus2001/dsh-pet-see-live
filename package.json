@@ -1,6 +1,6 @@
 {
   "name": "dsh-pet-see-live",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Let dsh-pet see your screen and hear live audio, then comment on it, using dsh-see-now's capture pipeline. Follows dsh lifecycle; pauses when pet is closed.",
   "type": "module",
   "license": "Apache-2.0",
@@ -29,5 +29,21 @@
       "immediately": false,
       "inject": []
     }
+  },
+  "files": [
+    "index.mjs",
+    "client.js",
+    "dsh.plugin.json",
+    "cordis.patch.yml",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Camus2001/dsh-pet-see-live.git"
   }
 }
