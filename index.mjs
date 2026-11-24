@@ -349,6 +349,30 @@ async function readPetCatalog(base) {
   } catch { return null; }
 }
 
+/**
+ * 宿主访问校验：让 DSH 自己判断这个请求是否被允许（浏览器里任意网页都能打到本地端口，
+ * 不能只靠 origin 检查和 webServer 的 auth 选项——后者只有较新宿主才执行）。
+ * 新宿主走 admit()，0.2.2 等旧宿主走 requestRejection()，两种都没有时 fail closed。
+ * 返回 undefined 表示放行，返回数字表示拒绝的 HTTP 状态码。
+ */
+function hostAccessRejection(connection, req) {
+  if (!connection) return 503;
+  const admit = connection.admit;
+  if (typeof admit === 'function') {
+    try {
+      const a = admit.call(connection, req);
+      if (!a || typeof a !== 'object') return 503;
+      if ('rejection' in a) return a.rejection || undefined;
+      if ('peer' in a) return undefined;        // 有 peer = 放行
+      return 503;
+    } catch { return 503; }
+  }
+  const reject = connection.requestRejection;
+  if (typeof reject !== 'function') return 503;
+  try { return reject.call(connection, req) ?? undefined; }
+  catch { return 503; }
+}
+
 /** 挂设置页用的同源 HTTP API：GET /status、POST /config、POST /clear-acp。 */
 function installSettingsApi(ctx, focus, onWebServer, onConnection, host) {
   if (!ctx?.inject) return;
@@ -380,6 +404,13 @@ async function handleSettingsRequest(req, res, focus, host) {
     } catch (e) { log(`settings API respond ERR: ${e.message}`); }
   };
   try {
+    // 宿主门禁：不依赖较新宿主才执行的 auth:'required'，自己问 DSH 这个请求能不能放行。
+    // origin 检查保留作纵深防御，但不能替代它（无 origin 的请求会绕过 origin 检查）。
+    const rejection = hostAccessRejection(host?.getConnection?.(), req);
+    if (rejection) {
+      send(rejection, { ok: false, reason: 'forbidden' });
+      return;
+    }
     const origin = String(req.headers?.origin || '');
     if (origin && !/^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin)) {
       send(403, { ok: false, reason: 'forbidden' });
@@ -628,6 +659,7 @@ export async function apply(ctx) {
       return petCatalog;
     },
     clearAcp: async () => clearAcpSession(),
+    getConnection: () => connection,
   };
   installSettingsApi(ctx, focus, (ws) => { webServer = ws; }, (c) => { connection = c; }, settingsHost);
 
